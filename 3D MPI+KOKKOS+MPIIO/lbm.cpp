@@ -35,7 +35,6 @@ struct GenRandom
 
 void LBM::Initialize()
 {
-    // printf("rank=%d,x_lo=%d,y_lo=%d,z_lo=%d\n", comm.me, x_hi, y_hi, z_hi);
     f = Kokkos::View<double ****, Kokkos::CudaUVMSpace>("f", q, lx, ly, lz);
     ft = Kokkos::View<double ****, Kokkos::CudaUVMSpace>("ft", q, lx, ly, lz);
     fb = Kokkos::View<double ****, Kokkos::CudaUVMSpace>("fb", q, lx, ly, lz);
@@ -245,10 +244,11 @@ void LBM::Initialize()
     // distribution function initialization
     Kokkos::parallel_for(
         "initf", mdrange_policy4({0, 0, 0, 0}, {q, lx, ly, lz}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j, const int k) {
-            f(ii, i, j, k) = t(ii) * p(i, j, k) * 3.0 +
-                             t(ii) * (3.0 * (e(ii, 0) * ua(i, j, k) + e(ii, 1) * va(i, j, k) + e(ii, 2) * wa(i, j, k)) +
-                                      4.5 * pow((e(ii, 0) * ua(i, j, k) + e(ii, 1) * va(i, j, k) + e(ii, 2) * wa(i, j, k)), 2) -
-                                      1.5 * (pow(ua(i, j, k), 2) + pow(va(i, j, k), 2) + pow(wa(i, j, k), 2)));
+            double edu = e(ii, 0) * ua(i, j, k) + e(ii, 1) * va(i, j, k) + e(ii, 2) * wa(i, j, k);
+            double udu = pow(ua(i, j, k), 2) + pow(va(i, j, k), 2) + pow(wa(i, j, k), 2);
+            double eu2 = pow((e(ii, 0) * ua(i, j, k) + e(ii, 1) * va(i, j, k) + e(ii, 2) * wa(i, j, k)), 2);
+            
+            f(ii, i, j, k) = t(ii) * p(i, j, k) * 3.0 + t(ii) * (3.0 * edu + 4.5 * eu2 - 1.5 * udu);
 
             ft(ii, i, j, k) = 0;
         });
@@ -370,170 +370,7 @@ void LBM::Streaming()
     Kokkos::fence();
 };
 
-void LBM::Boundary()
-{
-    /*if (x_lo == 0)
-    {
-        Kokkos::parallel_for(
-            "bcl", mdrange_policy2({ghost - 1, ghost - 1}, {ly - ghost + 1, lz - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int j, const int k) {
-                f(1, ghost - 1, j, k) = f(bb(1), ghost + 1, j + 2 * e(1, 1), k + 2 * e(1, 2));
-                f(7, ghost - 1, j, k) = f(bb(7), ghost + 1, j + 2 * e(7, 1), k + 2 * e(7, 2));
-                f(9, ghost - 1, j, k) = f(bb(9), ghost + 1, j + 2 * e(9, 1), k + 2 * e(9, 2));
-                f(11, ghost - 1, j, k) = f(bb(11), ghost + 1, j + 2 * e(11, 1), k + 2 * e(11, 2));
-                f(13, ghost - 1, j, k) = f(bb(13), ghost + 1, j + 2 * e(13, 1), k + 2 * e(13, 2));
-                f(19, ghost - 1, j, k) = f(bb(19), ghost + 1, j + 2 * e(19, 1), k + 2 * e(19, 2));
-                f(21, ghost - 1, j, k) = f(bb(21), ghost + 1, j + 2 * e(21, 1), k + 2 * e(21, 2));
-                f(23, ghost - 1, j, k) = f(bb(23), ghost + 1, j + 2 * e(23, 1), k + 2 * e(23, 2));
-                f(25, ghost - 1, j, k) = f(bb(25), ghost + 1, j + 2 * e(25, 1), k + 2 * e(25, 2));
-            });
-    }
-    // right boundary free flow
-    if (x_hi == glx - 1)
-    {
-        Kokkos::parallel_for(
-            "bcr", mdrange_policy2({ghost - 1, ghost - 1}, {ly - ghost + 1, lz - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int j, const int k) {
-                f(2, lx - ghost, j, k) = f(bb(2), lx - ghost - 2, j, k);
-                f(8, lx - ghost, j, k) = f(bb(8), lx - ghost - 2, j + 2 * e(8, 1), k + 2 * e(8, 2));
-                f(10, lx - ghost, j, k) = f(bb(10), lx - ghost - 2, j + 2 * e(10, 1), k + 2 * e(10, 2));
-                f(12, lx - ghost, j, k) = f(bb(12), lx - ghost - 2, j + 2 * e(12, 1), k + 2 * e(12, 2));
-                f(14, lx - ghost, j, k) = f(bb(14), lx - ghost - 2, j + 2 * e(14, 1), k + 2 * e(14, 2));
-                f(20, lx - ghost, j, k) = f(bb(20), lx - ghost - 2, j + 2 * e(20, 1), k + 2 * e(20, 2));
-                f(22, lx - ghost, j, k) = f(bb(22), lx - ghost - 2, j + 2 * e(22, 1), k + 2 * e(22, 2));
-                f(24, lx - ghost, j, k) = f(bb(24), lx - ghost - 2, j + 2 * e(24, 1), k + 2 * e(24, 2));
-                f(26, lx - ghost, j, k) = f(bb(26), lx - ghost - 2, j + 2 * e(26, 1), k + 2 * e(26, 2));
-            });
-    }
-    // front boundary bounce back
-    if (y_lo == 0)
-    {
-        Kokkos::parallel_for(
-            "bcf", mdrange_policy2({ghost - 1, ghost - 1}, {lx - ghost + 1, lz - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int i, const int k) {
-                f(3, i, ghost - 1, k) = f(bb(3), i, ghost + 1, k);
-                f(7, i, ghost - 1, k) = f(bb(7), i + 2 * e(7, 0), ghost + 1, k + 2 * e(7, 2));
-                f(10, i, ghost - 1, k) = f(bb(10), i + 2 * e(10, 0), ghost + 1, k + 2 * e(10, 2));
-                f(15, i, ghost - 1, k) = f(bb(15), i + 2 * e(15, 0), ghost + 1, k + 2 * e(15, 2));
-                f(17, i, ghost - 1, k) = f(bb(17), i + 2 * e(17, 0), ghost + 1, k + 2 * e(17, 2));
-                f(19, i, ghost - 1, k) = f(bb(19), i + 2 * e(19, 0), ghost + 1, k + 2 * e(19, 2));
-                f(22, i, ghost - 1, k) = f(bb(22), i + 2 * e(22, 0), ghost + 1, k + 2 * e(22, 2));
-                f(23, i, ghost - 1, k) = f(bb(23), i + 2 * e(23, 0), ghost + 1, k + 2 * e(23, 2));
-                f(26, i, ghost - 1, k) = f(bb(26), i + 2 * e(26, 0), ghost + 1, k + 2 * e(26, 2));
-            });
-    }
-    // back boundary bounce back
-    if (y_hi == gly - 1)
-    {
-        Kokkos::parallel_for(
-            "bcb", mdrange_policy2({ghost - 1, ghost - 1}, {lx - ghost + 1, lz - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int i, const int k) {
-                f(4, i, ly - ghost, k) = f(bb(4), i, ly - ghost - 2, k);
-                f(8, i, ly - ghost, k) = f(bb(8), i + 2 * e(8, 0), ly - ghost - 2, k + 2 * e(8, 2));
-                f(9, i, ly - ghost, k) = f(bb(9), i + 2 * e(9, 0), ly - ghost - 2, k + 2 * e(9, 2));
-                f(16, i, ly - ghost, k) = f(bb(16), i + 2 * e(16, 0), ly - ghost - 2, k + 2 * e(16, 2));
-                f(18, i, ly - ghost, k) = f(bb(18), i + 2 * e(18, 0), ly - ghost - 2, k + 2 * e(18, 2));
-                f(20, i, ly - ghost, k) = f(bb(20), i + 2 * e(20, 0), ly - ghost - 2, k + 2 * e(20, 2));
-                f(21, i, ly - ghost, k) = f(bb(21), i + 2 * e(21, 0), ly - ghost - 2, k + 2 * e(21, 2));
-                f(24, i, ly - ghost, k) = f(bb(24), i + 2 * e(24, 0), ly - ghost - 2, k + 2 * e(24, 2));
-                f(25, i, ly - ghost, k) = f(bb(25), i + 2 * e(25, 0), ly - ghost - 2, k + 2 * e(25, 2));
-            });
-    }
-    // bottom boundary bounce back
-    if (z_lo == 0)
-    {
-        Kokkos::parallel_for(
-            "bcd", mdrange_policy2({ghost - 1, ghost - 1}, {lx - ghost + 1, ly - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int i, const int j) {
-                f(5, i, j, ghost - 1) = f(bb(5), i, j, ghost + 1);
-                f(11, i, j, ghost - 1) = f(bb(11), i + 2 * e(11, 0), j + 2 * e(11, 1), ghost + 1);
-                f(14, i, j, ghost - 1) = f(bb(14), i + 2 * e(14, 0), j + 2 * e(14, 1), ghost + 1);
-                f(15, i, j, ghost - 1) = f(bb(15), i + 2 * e(15, 0), j + 2 * e(15, 1), ghost + 1);
-                f(18, i, j, ghost - 1) = f(bb(18), i + 2 * e(18, 0), j + 2 * e(18, 1), ghost + 1);
-                f(19, i, j, ghost - 1) = f(bb(19), i + 2 * e(19, 0), j + 2 * e(19, 1), ghost + 1);
-                f(21, i, j, ghost - 1) = f(bb(21), i + 2 * e(21, 0), j + 2 * e(21, 1), ghost + 1);
-                f(24, i, j, ghost - 1) = f(bb(24), i + 2 * e(24, 0), j + 2 * e(24, 1), ghost + 1);
-                f(26, i, j, ghost - 1) = f(bb(26), i + 2 * e(26, 0), j + 2 * e(26, 1), ghost + 1);
-            });
-    }
-    // top boundary bounce back
-    if (z_hi == glz - 1)
-    {
-        Kokkos::parallel_for(
-            "bcu", mdrange_policy2({ghost - 1, ghost - 1}, {lx - ghost + 1, ly - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int i, const int j) {
-                if (e)
-                    f(6, i, j, lz - ghost) = f(bb(6), i, j, lz - ghost - 2);
-                f(12, i, j, lz - ghost) = f(bb(12), i + 2 * e(12, 0), j + 2 * e(12, 1), lz - ghost - 2) - e(12, 0) * 6.0 * t(bb(12)) * u0;
-                f(13, i, j, lz - ghost) = f(bb(13), i + 2 * e(13, 0), j + 2 * e(13, 1), lz - ghost - 2) - e(13, 0) * 6.0 * t(bb(13)) * u0;
-                f(16, i, j, lz - ghost) = f(bb(16), i + 2 * e(16, 0), j + 2 * e(16, 1), lz - ghost - 2) - e(16, 0) * 6.0 * t(bb(16)) * u0;
-                f(17, i, j, lz - ghost) = f(bb(17), i + 2 * e(17, 0), j + 2 * e(17, 1), lz - ghost - 2) + e(17, 0) * 6.0 * t(bb(17)) * u0;
-                f(20, i, j, lz - ghost) = f(bb(20), i + 2 * e(20, 0), j + 2 * e(20, 1), lz - ghost - 2) - e(20, 0) * 6.0 * t(bb(20)) * u0;
-                f(22, i, j, lz - ghost) = f(bb(22), i + 2 * e(22, 0), j + 2 * e(22, 1), lz - ghost - 2) + e(22, 0) * 6.0 * t(bb(22)) * u0;
-                f(23, i, j, lz - ghost) = f(bb(23), i + 2 * e(23, 0), j + 2 * e(23, 1), lz - ghost - 2) + e(23, 0) * 6.0 * t(bb(23)) * u0;
-                f(25, i, j, lz - ghost) = f(bb(25), i + 2 * e(25, 0), j + 2 * e(25, 1), lz - ghost - 2) + e(25, 0) * 6.0 * t(bb(25)) * u0;
-            });
-    }*/
-    if (x_lo == 0)
-    {
 
-        Kokkos::parallel_for(
-            "1", mdrange_policy3({0, l_s[1] - 1, l_s[2] - 1}, {q, l_e[1] + 1, l_e[2] + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int j, const int k) {
-                if (e(ii, 0) > 0)
-                {
-                    f(ii, l_s[0] - 1, j, k) = f(bb(ii), l_s[0], j + e(ii, 1), k + e(ii, 2));
-                }
-            });
-    }
-    if (x_hi == glx - 1)
-    {
-
-        Kokkos::parallel_for(
-            "2", mdrange_policy3({0, l_s[1] - 1, l_s[2] - 1}, {q, l_e[1] + 1, l_e[2] + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int j, const int k) {
-                if (e(ii, 0) < 0)
-                {
-                    f(ii, l_e[0], j, k) = f(bb(ii), l_e[0] - 1, j + e(ii, 1), k + e(ii, 2));
-                }
-            });
-    }
-
-    // front boundary bounce back
-    if (y_lo == 0)
-    {
-        Kokkos::parallel_for(
-            "3", mdrange_policy3({0, l_s[0] - 1, l_s[2] - 1}, {q, l_e[0] + 1, l_e[2] + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int k) {
-                if (e(ii, 1) > 0)
-                {
-                    f(ii, i, l_s[1] - 1, k) = f(bb(ii), i + e(ii, 0), l_s[1], k + e(ii, 2));
-                }
-            });
-    }
-
-    if (y_hi == gly - 1)
-    {
-        Kokkos::parallel_for(
-            "4", mdrange_policy3({0, l_s[0] - 1, l_s[2] - 1}, {q, l_e[0] + 1, l_e[2] + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int k) {
-                if (e(ii, 1) < 0)
-                {
-                    f(ii, i, l_e[1], k) = f(bb(ii), i + e(ii, 0), l_e[1] - 1, k + e(ii, 2));
-                }
-            });
-    }
-    if (z_lo == 0)
-    {
-        Kokkos::parallel_for(
-            "5", mdrange_policy3({0, l_s[0] - 1, l_s[1] - 1}, {q, l_e[0] + 1, l_e[1] + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j) {
-                if (e(ii, 2) > 0)
-                {
-                    f(ii, i, j, l_s[2] - 1) = f(bb(ii), i + e(ii, 0), j + e(ii, 1), l_s[2]);
-                }
-            });
-    }
-    if (z_hi == glz - 1)
-    {
-        Kokkos::parallel_for(
-            "6", mdrange_policy3({0, l_s[0] - 1, l_s[1] - 1}, {q, l_e[0] + 1, l_e[1] + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j) {
-                if (e(ii, 2) < 0)
-                {
-                    f(ii, i, j, l_e[2]) = f(bb(ii), i + e(ii, 0), j + e(ii, 1), l_e[2] - 1) - e(bb(ii), 0) * 6.0 * t(bb(ii)) * u0;
-                }
-            });
-    }
-}
 void LBM::Update()
 {
     Kokkos::parallel_for(
