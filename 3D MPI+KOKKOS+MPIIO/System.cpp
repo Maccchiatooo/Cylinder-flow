@@ -5,7 +5,7 @@ using namespace std;
 System::System()
 {
     // system defination
-    this->cs2 = 1.0 / 3.0;
+        this->cs2 = 1.0 / 3.0;
     this->cs = sqrt(cs2);
 
     fstream input;
@@ -17,6 +17,9 @@ System::System()
     this->Ma = this->u0 / this->cs;
     this->miu = this->rho0 * this->u0 * this->R / this->Re;
     this->tau = this->u0 * this->R / Re / cs2;
+
+    this->Time = pow(2 * R, 2) / this->miu;
+    this->inter = this->Time / 10;
 }
 
 void System::Monitor()
