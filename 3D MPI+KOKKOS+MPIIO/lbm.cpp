@@ -1,8 +1,4 @@
 #include "lbm.hpp"
-#include <cstring>
-#include <stdexcept>
-#include <iostream>
-#include <algorithm>
 
 template <class RandPool>
 struct GenRandom
@@ -39,15 +35,23 @@ struct GenRandom
 
 void LBM::Initialize()
 {
-    // index bound values for different cpu cores
-    x_lo = ex * comm.px;
-    x_hi = ex * (comm.px + 1);
-    y_lo = ey * comm.py;
-    y_hi = ey * (comm.py + 1);
-    z_lo = ez * comm.pz;
-    z_hi = ez * (comm.pz + 1);
+    // printf("rank=%d,x_lo=%d,y_lo=%d,z_lo=%d\n", comm.me, x_hi, y_hi, z_hi);
+    f = Kokkos::View<double ****, Kokkos::CudaUVMSpace>("f", q, lx, ly, lz);
+    ft = Kokkos::View<double ****, Kokkos::CudaUVMSpace>("ft", q, lx, ly, lz);
+    fb = Kokkos::View<double ****, Kokkos::CudaUVMSpace>("fb", q, lx, ly, lz);
 
-    // printf("Me=%i,x_lo=%i,y_lo=%i,z_lo=%i,x_hi=%i,y_hi=%i,z_hi=%i\n", comm.me, x_lo, y_lo, z_lo, x_hi, y_hi, z_hi);
+    ua = Kokkos::View<double ***, Kokkos::CudaUVMSpace>("u", lx, ly, lz);
+    va = Kokkos::View<double ***, Kokkos::CudaUVMSpace>("v", lx, ly, lz);
+    wa = Kokkos::View<double ***, Kokkos::CudaUVMSpace>("v", lx, ly, lz);
+    rho = Kokkos::View<double ***, Kokkos::CudaUVMSpace>("rho", lx, ly, lz);
+    p = Kokkos::View<double ***, Kokkos::CudaUVMSpace>("p", lx, ly, lz);
+
+    e = Kokkos::View<int **, Kokkos::CudaUVMSpace>("e", q, dim);
+    t = Kokkos::View<double *, Kokkos::CudaUVMSpace>("t", q);
+    usr = Kokkos::View<int ***, Kokkos::CudaUVMSpace>("usr", lx, ly, lz);
+    ran = Kokkos::View<int ***, Kokkos::CudaUVMSpace>("ran", lx, ly, lz);
+    bb = Kokkos::View<int *, Kokkos::CudaUVMSpace>("b", q);
+
     //  weight function
     t(0) = 8.0 / 27.0;
     t(1) = 2.0 / 27.0;
@@ -213,7 +217,8 @@ void LBM::Initialize()
     e(26, 0) = -1;
     e(26, 1) = 1;
     e(26, 2) = 1;
-    // generate random velocity
+
+    // macroscopic value initialization
     typedef typename Kokkos::Random_XorShift64_Pool<>
         RandPoolType;
     RandPoolType rand_pool(5374857);
@@ -231,7 +236,7 @@ void LBM::Initialize()
             wa(i, j, k) = 0;
             p(i, j, k) = 0;
             rho(i, j, k) = rho0;
-            usr(i, j, k) = (pow((x_lo + i - ghost - (glx - 1) / 8), 2) + pow((y_lo + j - ghost - (glx - 1) / 8), 2) + pow((z_lo + k - ghost - (glx - 1) / 8), 2) <= 16) ? 0 : 1;
+            usr(i, j, k) = (pow((x_lo + i - ghost - (glx - 1) / 8), 2) + pow((y_lo + j - ghost - (glx - 1) / 8), 2) + pow((z_lo + k - ghost - (glx - 1) / 8), 2) <= pow(((glx - 1) / 64.0), 2)) ? 0 : 1;
             ua(i, j, k) = (u0 * 4.0 * (z_lo + k - ghost) * (glz - 1 - (z_lo + k - ghost)) / pow((glz - 1), 2)) * usr(i, j, k) * (1.0 + ran(i, j, k) * 0.001);
             va(i, j, k) = 0.0;
             wa(i, j, k) = 0.0;
@@ -247,955 +252,155 @@ void LBM::Initialize()
 
             ft(ii, i, j, k) = 0;
         });
+    Kokkos::fence();
 };
 void LBM::Collision()
 {
-
     // collision
 
     Kokkos::parallel_for(
-        "collision", mdrange_policy4({0, ghost, ghost, ghost}, {q, lx - ghost, ly - ghost, lz - ghost}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j, const int k) {
-            double feq = t(ii) * p(i, j, k) * 3.0 +
-                         t(ii) * (3.0 * (e(ii, 0) * ua(i, j, k) + e(ii, 1) * va(i, j, k) + e(ii, 2) * wa(i, j, k)) +
-                                  4.5 * pow((e(ii, 0) * ua(i, j, k) + e(ii, 1) * va(i, j, k) + e(ii, 2) * wa(i, j, k)), 2) -
-                                  1.5 * (pow(ua(i, j, k), 2) + pow(va(i, j, k), 2) + pow(wa(i, j, k), 2)));
+        "collision", mdrange_policy4({0, l_s[0], l_s[1], l_s[2]}, {q, l_e[0], l_e[1], l_e[2]}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j, const int k) {
+            double edu = e(ii, 0) * ua(i, j, k) + e(ii, 1) * va(i, j, k) + e(ii, 2) * wa(i, j, k);
+            double udu = pow(ua(i, j, k), 2) + pow(va(i, j, k), 2) + pow(wa(i, j, k), 2);
+            double eu2 = pow((e(ii, 0) * ua(i, j, k) + e(ii, 1) * va(i, j, k) + e(ii, 2) * wa(i, j, k)), 2);
+
+            double feq = t(ii) * p(i, j, k) * 3.0 + t(ii) * (3.0 * edu + 4.5 * eu2 - 1.5 * udu);
+
             f(ii, i, j, k) -= (f(ii, i, j, k) - feq) / (tau0 + 0.5);
         });
+    Kokkos::fence();
 };
-
-void LBM::setup_subdomain()
-{
-
-    // prepare the value needs to be transfered
-    // 6 faces
-
-    m_left = buffer_t("m_left", q, ey, ez);
-
-    m_right = buffer_t("m_right", q, ey, ez);
-
-    m_down = buffer_t("m_down", q, ex, ey);
-
-    m_up = buffer_t("m_up", q, ex, ey);
-
-    m_front = buffer_t("m_front", q, ex, ez);
-
-    m_back = buffer_t("m_back", q, ex, ez);
-    // 12 lines
-
-    m_leftup = buffer_ut("m_leftup", q, ey);
-
-    m_rightup = buffer_ut("m_rightup", q, ey);
-
-    m_leftdown = buffer_ut("m_leftdown", q, ey);
-
-    m_rightdown = buffer_ut("m_rightdown", q, ey);
-
-    m_backleft = buffer_ut("m_backleft", q, ez);
-
-    m_backright = buffer_ut("m_backright", q, ez);
-
-    m_frontleft = buffer_ut("m_frontleft", q, ez);
-
-    m_frontright = buffer_ut("m_frontdown", q, ez);
-
-    m_backdown = buffer_ut("m_backdown", q, ex);
-
-    m_backup = buffer_ut("m_backup", q, ex);
-
-    m_frontdown = buffer_ut("m_frontdown", q, ex);
-
-    m_frontup = buffer_ut("m_frontup", q, ex);
-
-    m_frontleftdown = buffer_st("m_fld", q);
-
-    m_frontrightdown = buffer_st("m_frd", q);
-
-    m_frontleftup = buffer_st("m_flu", q);
-
-    m_frontrightup = buffer_st("m_fru", q);
-
-    m_backleftdown = buffer_st("m_bld", q);
-
-    m_backrightdown = buffer_st("m_brd", q);
-
-    m_backleftup = buffer_st("m_blu", q);
-
-    m_backrightup = buffer_st("m_bru", q);
-
-    // outdirection
-    // 6 faces
-
-    m_leftout = buffer_t("m_leftout", q, ey, ez);
-
-    m_rightout = buffer_t("m_rightout", q, ey, ez);
-
-    m_downout = buffer_t("m_downout", q, ex, ey);
-
-    m_upout = buffer_t("m_upout", q, ex, ey);
-
-    m_frontout = buffer_t("m_downout", q, ex, ez);
-
-    m_backout = buffer_t("m_backout", q, ex, ez);
-
-    m_leftupout = buffer_ut("m_leftupout", q, ey);
-
-    m_rightupout = buffer_ut("m_rightupout", q, ey);
-
-    m_leftdownout = buffer_ut("m_leftdownout", q, ey);
-
-    m_rightdownout = buffer_ut("m_rightdownout", q, ey);
-
-    m_backleftout = buffer_ut("m_backleftout", q, ez);
-
-    m_backrightout = buffer_ut("m_backrightout", q, ez);
-
-    m_frontleftout = buffer_ut("m_frontleftout", q, ez);
-
-    m_frontrightout = buffer_ut("m_frontdownout", q, ez);
-
-    m_backdownout = buffer_ut("m_backdownout", q, ex);
-
-    m_backupout = buffer_ut("m_backupout", q, ex);
-
-    m_frontdownout = buffer_ut("m_frontdownout", q, ex);
-
-    m_frontupout = buffer_ut("m_frontupout", q, ex);
-
-    m_frontleftdownout = buffer_st("m_fldout", q);
-
-    m_frontrightdownout = buffer_st("m_frdout", q);
-
-    m_frontleftupout = buffer_st("m_fluout", q);
-
-    m_frontrightupout = buffer_st("m_fruout", q);
-
-    m_backleftdownout = buffer_st("m_bldout", q);
-
-    m_backrightdownout = buffer_st("m_brdout", q);
-
-    m_backleftupout = buffer_st("m_bluout", q);
-
-    m_backrightupout = buffer_st("m_bruout", q);
-}
-void LBM::pack()
-{
-    // 6 faces
-
-    Kokkos::deep_copy(m_leftout, Kokkos::subview(f, Kokkos::ALL, ghost, std::make_pair(ghost, ly - ghost), std::make_pair(ghost, lz - ghost)));
-
-    Kokkos::deep_copy(m_rightout, Kokkos::subview(f, Kokkos::ALL, lx - ghost - 1, std::make_pair(ghost, ly - ghost), std::make_pair(ghost, lz - ghost)));
-
-    Kokkos::deep_copy(m_downout, Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), std::make_pair(ghost, ly - ghost), ghost));
-
-    Kokkos::deep_copy(m_upout, Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), std::make_pair(ghost, ly - ghost), lz - ghost - 1));
-
-    Kokkos::deep_copy(m_frontout, Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ghost, std::make_pair(ghost, lz - ghost)));
-
-    Kokkos::deep_copy(m_backout, Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ly - ghost - 1, std::make_pair(ghost, lz - ghost)));
-    // 12 lines
-
-    Kokkos::deep_copy(m_leftupout, Kokkos::subview(f, Kokkos::ALL, ghost, std::make_pair(ghost, ly - ghost), lz - ghost - 1));
-
-    Kokkos::deep_copy(m_rightupout, Kokkos::subview(f, Kokkos::ALL, lx - ghost - 1, std::make_pair(ghost, ly - ghost), lz - ghost - 1));
-
-    Kokkos::deep_copy(m_frontleftout, Kokkos::subview(f, Kokkos::ALL, ghost, ghost, std::make_pair(ghost, lz - ghost)));
-
-    Kokkos::deep_copy(m_frontrightout, Kokkos::subview(f, Kokkos::ALL, lx - ghost - 1, ghost, std::make_pair(ghost, lz - ghost)));
-
-    Kokkos::deep_copy(m_leftdownout, Kokkos::subview(f, Kokkos::ALL, ghost, std::make_pair(ghost, ly - ghost), ghost));
-
-    Kokkos::deep_copy(m_rightdownout, Kokkos::subview(f, Kokkos::ALL, lx - ghost - 1, std::make_pair(ghost, ly - ghost), ghost));
-
-    Kokkos::deep_copy(m_backleftout, Kokkos::subview(f, Kokkos::ALL, ghost, ly - ghost - 1, std::make_pair(ghost, lz - ghost)));
-
-    Kokkos::deep_copy(m_backrightout, Kokkos::subview(f, Kokkos::ALL, lx - ghost - 1, ly - ghost - 1, std::make_pair(ghost, lz - ghost)));
-
-    Kokkos::deep_copy(m_frontupout, Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ghost, lz - ghost - 1));
-
-    Kokkos::deep_copy(m_frontdownout, Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ghost, ghost));
-
-    Kokkos::deep_copy(m_backupout, Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ly - ghost - 1, lz - ghost - 1));
-
-    Kokkos::deep_copy(m_backdownout, Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ly - ghost - 1, ghost));
-    // 8 points
-
-    Kokkos::deep_copy(m_frontleftdownout, Kokkos::subview(f, Kokkos::ALL, ghost, ghost, ghost));
-
-    Kokkos::deep_copy(m_frontrightdownout, Kokkos::subview(f, Kokkos::ALL, lx - ghost - 1, ghost, ghost));
-
-    Kokkos::deep_copy(m_backleftdownout, Kokkos::subview(f, Kokkos::ALL, ghost, ly - ghost - 1, ghost));
-
-    Kokkos::deep_copy(m_backrightdownout, Kokkos::subview(f, Kokkos::ALL, lx - ghost - 1, ly - ghost - 1, ghost));
-
-    Kokkos::deep_copy(m_frontleftupout, Kokkos::subview(f, Kokkos::ALL, ghost, ghost, lz - ghost - 1));
-
-    Kokkos::deep_copy(m_frontrightupout, Kokkos::subview(f, Kokkos::ALL, lx - ghost - 1, ghost, lz - ghost - 1));
-
-    Kokkos::deep_copy(m_backleftupout, Kokkos::subview(f, Kokkos::ALL, ghost, ly - ghost - 1, lz - ghost - 1));
-
-    Kokkos::deep_copy(m_backrightupout, Kokkos::subview(f, Kokkos::ALL, lx - ghost - 1, ly - ghost - 1, lz - ghost - 1));
-}
-
-void LBM::exchange()
-{
-    // 6 faces
-    int mar = 1;
-
-    if (x_lo != 0)
-        MPI_Send(m_leftout.data(), m_leftout.size(), MPI_DOUBLE, comm.left, mar, comm.comm);
-
-    if (x_hi != glx)
-        MPI_Recv(m_right.data(), m_right.size(), MPI_DOUBLE, comm.right, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 2;
-    if (x_hi != glx)
-        MPI_Send(m_rightout.data(), m_rightout.size(), MPI_DOUBLE, comm.right, mar, comm.comm);
-
-    if (x_lo != 0)
-        MPI_Recv(m_left.data(), m_left.size(), MPI_DOUBLE, comm.left, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 3;
-
-    if (z_lo != 0)
-        MPI_Send(m_downout.data(), m_downout.size(), MPI_DOUBLE, comm.down, mar, comm.comm);
-
-    if (z_hi != glz)
-        MPI_Recv(m_up.data(), m_up.size(), MPI_DOUBLE, comm.up, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 4;
-    if (z_hi != glz)
-        MPI_Send(m_upout.data(), m_upout.size(), MPI_DOUBLE, comm.up, mar, comm.comm);
-
-    if (z_lo != 0)
-        MPI_Recv(m_down.data(), m_down.size(), MPI_DOUBLE, comm.down, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 5;
-    if (y_lo != 0)
-        MPI_Send(m_frontout.data(), m_frontout.size(), MPI_DOUBLE, comm.front, mar, comm.comm);
-
-    if (y_hi != gly)
-        MPI_Recv(m_back.data(), m_back.size(), MPI_DOUBLE, comm.back, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 6;
-    if (y_hi != gly)
-        MPI_Send(m_backout.data(), m_backout.size(), MPI_DOUBLE, comm.back, mar, comm.comm);
-
-    if (y_lo != 0)
-        MPI_Recv(m_front.data(), m_front.size(), MPI_DOUBLE, comm.front, mar, comm.comm, MPI_STATUSES_IGNORE);
-    // 12 lines
-    mar = 7;
-    if (x_lo != 0 && y_lo != 0)
-        MPI_Send(m_frontleftout.data(), m_frontleftout.size(), MPI_DOUBLE, comm.frontleft, mar, comm.comm);
-
-    if (x_hi != glx && y_hi != gly)
-        MPI_Recv(m_backright.data(), m_backright.size(), MPI_DOUBLE, comm.backright, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 8;
-    if (x_hi != glx && y_hi != gly)
-        MPI_Send(m_backrightout.data(), m_backrightout.size(), MPI_DOUBLE, comm.backright, mar, comm.comm);
-
-    if (x_lo != 0 && y_lo != 0)
-        MPI_Recv(m_frontleft.data(), m_frontleft.size(), MPI_DOUBLE, comm.frontleft, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 9;
-    if (x_hi != glx && y_lo != 0)
-        MPI_Send(m_frontrightout.data(), m_frontrightout.size(), MPI_DOUBLE, comm.frontright, mar, comm.comm);
-
-    if (x_lo != 0 && y_hi != gly)
-        MPI_Recv(m_backleft.data(), m_backleft.size(), MPI_DOUBLE, comm.backleft, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 10;
-    if (x_lo != 0 && y_hi != gly)
-        MPI_Send(m_backleftout.data(), m_backleftout.size(), MPI_DOUBLE, comm.backleft, mar, comm.comm);
-
-    if (x_hi != glx && y_lo != 0)
-        MPI_Recv(m_frontright.data(), m_frontright.size(), MPI_DOUBLE, comm.frontright, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 11;
-    if (x_lo != 0 && z_hi != glz)
-        MPI_Send(m_leftupout.data(), m_leftupout.size(), MPI_DOUBLE, comm.leftup, mar, comm.comm);
-
-    if (x_hi != glx && z_lo != 0)
-        MPI_Recv(m_rightdown.data(), m_rightdown.size(), MPI_DOUBLE, comm.rightdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 12;
-
-    if (x_hi != glx && z_lo != 0)
-        MPI_Send(m_rightdownout.data(), m_rightdownout.size(), MPI_DOUBLE, comm.rightdown, mar, comm.comm);
-
-    if (x_lo != 0 && z_hi != glz)
-        MPI_Recv(m_leftup.data(), m_leftup.size(), MPI_DOUBLE, comm.leftup, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 13;
-    if (x_lo != 0 && z_lo != 0)
-        MPI_Send(m_leftdownout.data(), m_leftdownout.size(), MPI_DOUBLE, comm.leftdown, mar, comm.comm);
-
-    if (x_hi != glx && z_hi != glz)
-        MPI_Recv(m_rightup.data(), m_rightup.size(), MPI_DOUBLE, comm.rightup, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 14;
-    if (x_hi != glx && z_hi != glz)
-        MPI_Send(m_rightupout.data(), m_rightupout.size(), MPI_DOUBLE, comm.rightup, mar, comm.comm);
-
-    if (x_lo != 0 && z_lo != 0)
-        MPI_Recv(m_leftdown.data(), m_leftdown.size(), MPI_DOUBLE, comm.leftdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 15;
-    if (y_lo != 0 && z_hi != glz)
-        MPI_Send(m_frontupout.data(), m_frontupout.size(), MPI_DOUBLE, comm.frontup, mar, comm.comm);
-
-    if (y_hi != gly && z_lo != 0)
-        MPI_Recv(m_backdown.data(), m_backdown.size(), MPI_DOUBLE, comm.backdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 16;
-    if (y_hi != gly && z_lo != 0)
-        MPI_Send(m_backdownout.data(), m_backdownout.size(), MPI_DOUBLE, comm.backdown, mar, comm.comm);
-
-    if (y_lo != 0 && z_hi != glz)
-        MPI_Recv(m_frontup.data(), m_frontup.size(), MPI_DOUBLE, comm.frontup, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 17;
-    if (y_lo != 0 && z_lo != 0)
-        MPI_Send(m_frontdownout.data(), m_frontdownout.size(), MPI_DOUBLE, comm.frontdown, mar, comm.comm);
-
-    if (y_hi != gly && z_hi != glz)
-        MPI_Recv(m_backup.data(), m_backup.size(), MPI_DOUBLE, comm.backup, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 18;
-    if (y_hi != gly && z_hi != glz)
-        MPI_Send(m_backupout.data(), m_backupout.size(), MPI_DOUBLE, comm.backup, mar, comm.comm);
-
-    if (y_lo != 0 && z_lo != 0)
-        MPI_Recv(m_frontdown.data(), m_frontdown.size(), MPI_DOUBLE, comm.frontdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-    // 8 points
-    mar = 19;
-    if (x_lo != 0 && y_lo != 0 && z_lo != 0)
-        MPI_Send(m_frontleftdownout.data(), m_frontleftdownout.size(), MPI_DOUBLE, comm.frontleftdown, mar, comm.comm);
-
-    if (x_hi != glx && y_hi != gly && z_hi != glz)
-        MPI_Recv(m_backrightup.data(), m_backrightup.size(), MPI_DOUBLE, comm.backrightup, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 20;
-    if (x_hi != glx && y_hi != gly && z_hi != glz)
-        MPI_Send(m_backrightupout.data(), m_backrightupout.size(), MPI_DOUBLE, comm.backrightup, mar, comm.comm);
-
-    if (x_lo != 0 && y_lo != 0 && z_lo != 0)
-        MPI_Recv(m_frontleftdown.data(), m_frontleftdown.size(), MPI_DOUBLE, comm.frontleftdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 21;
-    if (x_lo != 0 && y_hi != gly && z_hi != glz)
-        MPI_Send(m_backleftupout.data(), m_backleftupout.size(), MPI_DOUBLE, comm.backleftup, mar, comm.comm);
-
-    if (x_hi != glx && y_lo != 0 && z_lo != 0)
-        MPI_Recv(m_frontrightdown.data(), m_frontrightdown.size(), MPI_DOUBLE, comm.frontrightdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 22;
-    if (x_hi != glx && y_lo != 0 && z_lo != 0)
-        MPI_Send(m_frontrightdownout.data(), m_frontrightdownout.size(), MPI_DOUBLE, comm.frontrightdown, mar, comm.comm);
-
-    if (x_lo != 0 && y_hi != gly && z_hi != glz)
-        MPI_Recv(m_backleftup.data(), m_backleftup.size(), MPI_DOUBLE, comm.backleftup, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 23;
-    if (x_lo != 0 && y_hi != gly && z_lo != 0)
-        MPI_Send(m_backleftdownout.data(), m_backleftdownout.size(), MPI_DOUBLE, comm.backleftdown, mar, comm.comm);
-
-    if (x_hi != glx && y_lo != 0 && z_hi != glz)
-        MPI_Recv(m_frontrightup.data(), m_frontrightup.size(), MPI_DOUBLE, comm.frontrightup, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 24;
-    if (x_hi != glx && y_lo != 0 && z_hi != glz)
-        MPI_Send(m_frontrightupout.data(), m_frontrightupout.size(), MPI_DOUBLE, comm.frontrightup, mar, comm.comm);
-
-    if (x_lo != 0 && y_hi != gly && z_lo != 0)
-        MPI_Recv(m_backleftdown.data(), m_backleftdown.size(), MPI_DOUBLE, comm.backleftdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 25;
-    if (x_lo != 0 && y_lo != 0 && z_hi != glz)
-        MPI_Send(m_frontleftupout.data(), m_frontleftupout.size(), MPI_DOUBLE, comm.frontleftup, mar, comm.comm);
-
-    if (x_hi != glx && y_hi != gly && z_lo != 0)
-        MPI_Recv(m_backrightdown.data(), m_backrightdown.size(), MPI_DOUBLE, comm.backrightdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    mar = 26;
-    if (x_hi != glx && y_hi != gly && z_lo != 0)
-        MPI_Send(m_backrightdownout.data(), m_backrightdownout.size(), MPI_DOUBLE, comm.backrightdown, mar, comm.comm);
-
-    if (x_lo != 0 && y_lo != 0 && z_hi != glz)
-        MPI_Recv(m_frontleftup.data(), m_frontleftup.size(), MPI_DOUBLE, comm.frontleftup, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-    // edges outsides
-
-    if (x_lo == 0)
-    {
-
-        mar = 27;
-        if (z_hi != glz)
-            MPI_Send(m_leftupout.data(), m_leftupout.size(), MPI_DOUBLE, comm.up, mar, comm.comm);
-
-        if (z_lo != 0)
-            MPI_Recv(m_leftdown.data(), m_leftdown.size(), MPI_DOUBLE, comm.down, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 28;
-        if (y_hi != gly)
-            MPI_Send(m_backleftout.data(), m_backleftout.size(), MPI_DOUBLE, comm.back, mar, comm.comm);
-        if (y_lo != 0)
-            MPI_Recv(m_frontleft.data(), m_frontleft.size(), MPI_DOUBLE, comm.front, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 29;
-        if (z_lo != 0)
-            MPI_Send(m_leftdownout.data(), m_leftdownout.size(), MPI_DOUBLE, comm.down, mar, comm.comm);
-
-        if (z_hi != glz)
-            MPI_Recv(m_leftup.data(), m_leftup.size(), MPI_DOUBLE, comm.up, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 30;
-        if (y_lo != 0)
-            MPI_Send(m_frontleftout.data(), m_frontleftout.size(), MPI_DOUBLE, comm.front, mar, comm.comm);
-        if (y_hi != gly)
-            MPI_Recv(m_backleft.data(), m_backleft.size(), MPI_DOUBLE, comm.back, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 51;
-        if (z_hi != glz && y_lo != 0)
-            MPI_Send(m_frontleftupout.data(), m_frontleftupout.size(), MPI_DOUBLE, comm.frontup, mar, comm.comm);
-
-        if (z_lo != 0 && y_hi != gly)
-            MPI_Recv(m_backleftdown.data(), m_backleftdown.size(), MPI_DOUBLE, comm.backdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 52;
-        if (y_hi != gly && z_hi != glz)
-            MPI_Send(m_backleftupout.data(), m_backleftupout.size(), MPI_DOUBLE, comm.backup, mar, comm.comm);
-        if (y_lo != 0 && z_lo != 0)
-            MPI_Recv(m_frontleftdown.data(), m_frontleftdown.size(), MPI_DOUBLE, comm.frontdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 53;
-        if (z_lo != 0 && y_lo != 0)
-            MPI_Send(m_frontleftdownout.data(), m_frontleftdownout.size(), MPI_DOUBLE, comm.frontdown, mar, comm.comm);
-
-        if (z_hi != glz && y_hi != gly)
-            MPI_Recv(m_backleftup.data(), m_backleftup.size(), MPI_DOUBLE, comm.backup, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 54;
-        if (y_hi != gly && z_lo != 0)
-            MPI_Send(m_backleftdownout.data(), m_backleftdownout.size(), MPI_DOUBLE, comm.backdown, mar, comm.comm);
-        if (y_lo != 0 && z_hi != glz)
-            MPI_Recv(m_frontleftup.data(), m_frontleftup.size(), MPI_DOUBLE, comm.frontup, mar, comm.comm, MPI_STATUSES_IGNORE);
-    }
-
-    if (x_hi == glx)
-    {
-
-        mar = 31;
-        if (z_hi != glz)
-            MPI_Send(m_rightupout.data(), m_rightupout.size(), MPI_DOUBLE, comm.up, mar, comm.comm);
-
-        if (z_lo != 0)
-            MPI_Recv(m_rightdown.data(), m_rightdown.size(), MPI_DOUBLE, comm.down, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 32;
-        if (y_hi != gly)
-            MPI_Send(m_backrightout.data(), m_backrightout.size(), MPI_DOUBLE, comm.back, mar, comm.comm);
-        if (y_lo != 0)
-            MPI_Recv(m_frontright.data(), m_frontright.size(), MPI_DOUBLE, comm.front, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 33;
-        if (z_lo != 0)
-            MPI_Send(m_rightdownout.data(), m_rightdownout.size(), MPI_DOUBLE, comm.down, mar, comm.comm);
-
-        if (z_hi != glz)
-            MPI_Recv(m_rightup.data(), m_rightup.size(), MPI_DOUBLE, comm.up, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 34;
-        if (y_lo != 0)
-            MPI_Send(m_frontrightout.data(), m_frontrightout.size(), MPI_DOUBLE, comm.front, mar, comm.comm);
-        if (y_hi != gly)
-            MPI_Recv(m_backright.data(), m_backright.size(), MPI_DOUBLE, comm.back, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 55;
-        if (z_hi != glz && y_lo != 0)
-            MPI_Send(m_frontrightupout.data(), m_frontrightupout.size(), MPI_DOUBLE, comm.frontup, mar, comm.comm);
-
-        if (z_lo != 0 && y_hi != gly)
-            MPI_Recv(m_backrightdown.data(), m_backrightdown.size(), MPI_DOUBLE, comm.backdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 56;
-        if (y_hi != gly && z_hi != glz)
-            MPI_Send(m_backrightupout.data(), m_backrightupout.size(), MPI_DOUBLE, comm.backup, mar, comm.comm);
-        if (y_lo != 0 && z_lo != 0)
-            MPI_Recv(m_frontrightdown.data(), m_frontrightdown.size(), MPI_DOUBLE, comm.frontdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 57;
-        if (z_lo != 0 && y_lo != 0)
-            MPI_Send(m_frontrightdownout.data(), m_frontrightdownout.size(), MPI_DOUBLE, comm.frontdown, mar, comm.comm);
-
-        if (z_hi != glz && y_hi != gly)
-            MPI_Recv(m_backrightup.data(), m_backrightup.size(), MPI_DOUBLE, comm.backup, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 58;
-        if (y_hi != gly && z_lo != 0)
-            MPI_Send(m_backrightdownout.data(), m_backrightdownout.size(), MPI_DOUBLE, comm.backdown, mar, comm.comm);
-        if (y_lo != 0 && z_hi != glz)
-            MPI_Recv(m_frontrightup.data(), m_frontrightup.size(), MPI_DOUBLE, comm.frontup, mar, comm.comm, MPI_STATUSES_IGNORE);
-    }
-
-    if (y_lo == 0)
-    {
-
-        mar = 35;
-        if (z_hi != glz)
-            MPI_Send(m_frontupout.data(), m_frontupout.size(), MPI_DOUBLE, comm.up, mar, comm.comm);
-
-        if (z_lo != 0)
-            MPI_Recv(m_frontdown.data(), m_frontdown.size(), MPI_DOUBLE, comm.down, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 36;
-        if (x_hi != glx)
-            MPI_Send(m_frontrightout.data(), m_frontrightout.size(), MPI_DOUBLE, comm.right, mar, comm.comm);
-        if (x_lo != 0)
-            MPI_Recv(m_frontleft.data(), m_frontleft.size(), MPI_DOUBLE, comm.left, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 37;
-        if (z_lo != 0)
-            MPI_Send(m_frontdownout.data(), m_frontdownout.size(), MPI_DOUBLE, comm.down, mar, comm.comm);
-
-        if (z_hi != glz)
-            MPI_Recv(m_frontup.data(), m_frontup.size(), MPI_DOUBLE, comm.up, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 38;
-        if (x_lo != 0)
-            MPI_Send(m_frontleftout.data(), m_frontleftout.size(), MPI_DOUBLE, comm.left, mar, comm.comm);
-        if (x_hi != glx)
-            MPI_Recv(m_frontright.data(), m_frontright.size(), MPI_DOUBLE, comm.right, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 59;
-        if (z_hi != glz && x_lo != 0)
-            MPI_Send(m_frontleftupout.data(), m_frontleftupout.size(), MPI_DOUBLE, comm.leftup, mar, comm.comm);
-
-        if (z_lo != 0 && x_hi != glx)
-            MPI_Recv(m_frontrightdown.data(), m_frontrightdown.size(), MPI_DOUBLE, comm.rightdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 60;
-        if (x_hi != glx && z_hi != glz)
-            MPI_Send(m_frontrightupout.data(), m_frontrightupout.size(), MPI_DOUBLE, comm.rightup, mar, comm.comm);
-        if (x_lo != 0 && z_lo != 0)
-            MPI_Recv(m_frontleftdown.data(), m_frontleftdown.size(), MPI_DOUBLE, comm.leftdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 61;
-        if (z_lo != 0 && x_lo != 0)
-            MPI_Send(m_frontleftdownout.data(), m_frontleftdownout.size(), MPI_DOUBLE, comm.leftdown, mar, comm.comm);
-
-        if (z_hi != glz && x_hi != glx)
-            MPI_Recv(m_frontrightup.data(), m_frontrightup.size(), MPI_DOUBLE, comm.rightup, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 62;
-        if (x_hi != glx && z_lo != 0)
-            MPI_Send(m_frontrightdownout.data(), m_frontrightdownout.size(), MPI_DOUBLE, comm.rightdown, mar, comm.comm);
-        if (x_lo != 0 && z_hi != glz)
-            MPI_Recv(m_frontleftup.data(), m_frontleftup.size(), MPI_DOUBLE, comm.leftup, mar, comm.comm, MPI_STATUSES_IGNORE);
-    }
-
-    if (y_hi == gly)
-    {
-
-        mar = 39;
-        if (z_hi != glz)
-            MPI_Send(m_backupout.data(), m_backupout.size(), MPI_DOUBLE, comm.up, mar, comm.comm);
-
-        if (z_lo != 0)
-            MPI_Recv(m_backdown.data(), m_backdown.size(), MPI_DOUBLE, comm.down, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 40;
-        if (x_hi != glx)
-            MPI_Send(m_backrightout.data(), m_backrightout.size(), MPI_DOUBLE, comm.right, mar, comm.comm);
-        if (x_lo != 0)
-            MPI_Recv(m_backleft.data(), m_backleft.size(), MPI_DOUBLE, comm.left, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 41;
-        if (z_lo != 0)
-            MPI_Send(m_backdownout.data(), m_backdownout.size(), MPI_DOUBLE, comm.down, mar, comm.comm);
-
-        if (z_hi != glz)
-            MPI_Recv(m_backup.data(), m_backup.size(), MPI_DOUBLE, comm.up, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 42;
-        if (x_lo != 0)
-            MPI_Send(m_backleftout.data(), m_backleftout.size(), MPI_DOUBLE, comm.left, mar, comm.comm);
-        if (x_hi != glx)
-            MPI_Recv(m_backright.data(), m_backright.size(), MPI_DOUBLE, comm.right, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 63;
-        if (z_hi != glz && x_lo != 0)
-            MPI_Send(m_backleftupout.data(), m_backleftupout.size(), MPI_DOUBLE, comm.leftup, mar, comm.comm);
-
-        if (z_lo != 0 && x_hi != glx)
-            MPI_Recv(m_backrightdown.data(), m_backrightdown.size(), MPI_DOUBLE, comm.rightdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 64;
-        if (x_hi != glx && z_hi != glz)
-            MPI_Send(m_backrightupout.data(), m_backrightupout.size(), MPI_DOUBLE, comm.rightup, mar, comm.comm);
-        if (x_lo != 0 && z_lo != 0)
-            MPI_Recv(m_backleftdown.data(), m_backleftdown.size(), MPI_DOUBLE, comm.leftdown, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 65;
-        if (z_lo != 0 && x_lo != 0)
-            MPI_Send(m_backleftdownout.data(), m_backleftdownout.size(), MPI_DOUBLE, comm.leftdown, mar, comm.comm);
-
-        if (z_hi != glz && x_hi != glx)
-            MPI_Recv(m_backrightup.data(), m_backrightup.size(), MPI_DOUBLE, comm.rightup, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 66;
-        if (x_hi != glx && z_lo != 0)
-            MPI_Send(m_backrightdownout.data(), m_backrightdownout.size(), MPI_DOUBLE, comm.rightdown, mar, comm.comm);
-        if (x_lo != 0 && z_hi != glz)
-            MPI_Recv(m_backleftup.data(), m_backleftup.size(), MPI_DOUBLE, comm.leftup, mar, comm.comm, MPI_STATUSES_IGNORE);
-    }
-
-    if (z_hi == glz)
-    {
-
-        mar = 43;
-        if (y_hi != gly)
-            MPI_Send(m_backupout.data(), m_backupout.size(), MPI_DOUBLE, comm.back, mar, comm.comm);
-
-        if (y_lo != 0)
-            MPI_Recv(m_frontup.data(), m_frontup.size(), MPI_DOUBLE, comm.front, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 44;
-        if (x_hi != glx)
-            MPI_Send(m_rightupout.data(), m_rightupout.size(), MPI_DOUBLE, comm.right, mar, comm.comm);
-        if (x_lo != 0)
-            MPI_Recv(m_leftup.data(), m_leftup.size(), MPI_DOUBLE, comm.left, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 45;
-        if (y_lo != 0)
-            MPI_Send(m_frontupout.data(), m_frontupout.size(), MPI_DOUBLE, comm.front, mar, comm.comm);
-
-        if (y_hi != gly)
-            MPI_Recv(m_backup.data(), m_backup.size(), MPI_DOUBLE, comm.back, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 46;
-        if (x_lo != 0)
-            MPI_Send(m_leftupout.data(), m_leftupout.size(), MPI_DOUBLE, comm.left, mar, comm.comm);
-        if (x_hi != glx)
-            MPI_Recv(m_rightup.data(), m_rightup.size(), MPI_DOUBLE, comm.right, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 67;
-        if (y_hi != gly && x_lo != 0)
-            MPI_Send(m_backleftupout.data(), m_backleftupout.size(), MPI_DOUBLE, comm.backleft, mar, comm.comm);
-
-        if (y_lo != 0 && x_hi != glx)
-            MPI_Recv(m_frontrightup.data(), m_frontrightup.size(), MPI_DOUBLE, comm.frontright, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 68;
-        if (x_hi != glx && y_hi != gly)
-            MPI_Send(m_backrightupout.data(), m_backrightupout.size(), MPI_DOUBLE, comm.backright, mar, comm.comm);
-        if (x_lo != 0 && y_lo != 0)
-            MPI_Recv(m_frontleftup.data(), m_frontleftup.size(), MPI_DOUBLE, comm.frontleft, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 69;
-        if (y_lo != 0 && x_lo != 0)
-            MPI_Send(m_frontleftupout.data(), m_frontleftupout.size(), MPI_DOUBLE, comm.frontleft, mar, comm.comm);
-
-        if (y_hi != gly && x_hi != glx)
-            MPI_Recv(m_backrightup.data(), m_backrightup.size(), MPI_DOUBLE, comm.backright, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 70;
-        if (x_hi != glx && y_lo != 0)
-            MPI_Send(m_frontrightupout.data(), m_frontrightupout.size(), MPI_DOUBLE, comm.frontright, mar, comm.comm);
-        if (x_lo != 0 && y_hi != gly)
-            MPI_Recv(m_backleftup.data(), m_backleftup.size(), MPI_DOUBLE, comm.backleft, mar, comm.comm, MPI_STATUSES_IGNORE);
-    }
-
-    if (z_lo == 0)
-    {
-
-        mar = 47;
-        if (y_hi != gly)
-            MPI_Send(m_backdownout.data(), m_backdownout.size(), MPI_DOUBLE, comm.back, mar, comm.comm);
-
-        if (y_lo != 0)
-            MPI_Recv(m_frontdown.data(), m_frontdown.size(), MPI_DOUBLE, comm.front, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 48;
-        if (x_hi != glx)
-            MPI_Send(m_rightdownout.data(), m_rightdownout.size(), MPI_DOUBLE, comm.right, mar, comm.comm);
-        if (x_lo != 0)
-            MPI_Recv(m_leftdown.data(), m_leftdown.size(), MPI_DOUBLE, comm.left, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 49;
-        if (y_lo != 0)
-            MPI_Send(m_frontdownout.data(), m_frontdownout.size(), MPI_DOUBLE, comm.front, mar, comm.comm);
-
-        if (y_hi != gly)
-            MPI_Recv(m_backdown.data(), m_backdown.size(), MPI_DOUBLE, comm.back, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 50;
-        if (x_lo != 0)
-            MPI_Send(m_leftdownout.data(), m_leftdownout.size(), MPI_DOUBLE, comm.left, mar, comm.comm);
-        if (x_hi != glx)
-            MPI_Recv(m_rightdown.data(), m_rightdown.size(), MPI_DOUBLE, comm.right, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 71;
-        if (y_hi != gly && x_lo != 0)
-            MPI_Send(m_backleftdownout.data(), m_backleftdownout.size(), MPI_DOUBLE, comm.backleft, mar, comm.comm);
-
-        if (y_lo != 0 && x_hi != glx)
-            MPI_Recv(m_frontrightdown.data(), m_frontrightdown.size(), MPI_DOUBLE, comm.frontright, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 72;
-        if (x_hi != glx && y_hi != gly)
-            MPI_Send(m_backrightdownout.data(), m_backrightdownout.size(), MPI_DOUBLE, comm.backright, mar, comm.comm);
-        if (x_lo != 0 && y_lo != 0)
-            MPI_Recv(m_frontleftdown.data(), m_frontleftdown.size(), MPI_DOUBLE, comm.frontleft, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 73;
-        if (y_lo != 0 && x_lo != 0)
-            MPI_Send(m_frontleftdownout.data(), m_frontleftdownout.size(), MPI_DOUBLE, comm.frontleft, mar, comm.comm);
-
-        if (y_hi != gly && x_hi != glx)
-            MPI_Recv(m_backrightdown.data(), m_backrightdown.size(), MPI_DOUBLE, comm.backright, mar, comm.comm, MPI_STATUSES_IGNORE);
-
-        mar = 74;
-        if (x_hi != glx && y_lo != 0)
-            MPI_Send(m_frontrightdownout.data(), m_frontrightdownout.size(), MPI_DOUBLE, comm.frontright, mar, comm.comm);
-        if (x_lo != 0 && y_hi != gly)
-            MPI_Recv(m_backleftdown.data(), m_backleftdown.size(), MPI_DOUBLE, comm.backleft, mar, comm.comm, MPI_STATUSES_IGNORE);
-    }
-}
-
-void LBM::unpack()
-{
-    // 6 faces
-    if (x_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, std::make_pair(ghost, ly - ghost), std::make_pair(ghost, lz - ghost)), m_left);
-
-    if (x_hi != glx)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, std::make_pair(ghost, ly - ghost), std::make_pair(ghost, lz - ghost)), m_right);
-
-    if (z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), std::make_pair(ghost, ly - ghost), ghost - 1), m_down);
-
-    if (z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), std::make_pair(ghost, ly - ghost), lz - ghost), m_up);
-
-    if (y_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ghost - 1, std::make_pair(ghost, lz - ghost)), m_front);
-
-    if (y_hi != gly)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ly - ghost, std::make_pair(ghost, lz - ghost)), m_back);
-    // 12 lines
-    if (x_lo != 0 && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, std::make_pair(ghost, ly - ghost), lz - ghost), m_leftup);
-
-    if (x_hi != glx && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, std::make_pair(ghost, ly - ghost), lz - ghost), m_rightup);
-
-    if (x_lo != 0 && y_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ghost - 1, std::make_pair(ghost, lz - ghost)), m_frontleft);
-
-    if (x_hi != glx && y_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ghost - 1, std::make_pair(ghost, lz - ghost)), m_frontright);
-
-    if (x_lo != 0 && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, std::make_pair(ghost, ly - ghost), ghost - 1), m_leftdown);
-
-    if (x_hi != glx && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, std::make_pair(ghost, ly - ghost), ghost - 1), m_rightdown);
-
-    if (x_lo != 0 && y_hi != gly)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ly - ghost, std::make_pair(ghost, lz - ghost)), m_backleft);
-
-    if (x_hi != glx && y_hi != gly)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ly - ghost, std::make_pair(ghost, lz - ghost)), m_backright);
-
-    if (y_lo != 0 && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ghost - 1, lz - ghost), m_frontup);
-
-    if (y_lo != 0 && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ghost - 1, ghost - 1), m_frontdown);
-
-    if (y_hi != gly && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ly - ghost, lz - ghost), m_backup);
-
-    if (y_hi != gly && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ly - ghost, ghost - 1), m_backdown);
-    // 8 points
-    if (x_lo != 0 && y_lo != 0 && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ghost - 1, ghost - 1), m_frontleftdown);
-    if (x_hi != glx && y_lo != 0 && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ghost - 1, ghost - 1), m_frontrightdown);
-    if (x_lo != 0 && y_hi != gly && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ly - ghost, ghost - 1), m_backleftdown);
-    if (x_hi != glx && y_hi != gly && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ly - ghost, ghost - 1), m_backrightdown);
-    if (x_lo != 0 && y_lo != 0 && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ghost - 1, lz - ghost), m_frontleftup);
-    if (x_hi != glx && y_lo != 0 && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ghost - 1, lz - ghost), m_frontrightup);
-    if (x_lo != 0 && y_hi != gly && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ly - ghost, lz - ghost), m_backleftup);
-    if (x_hi != glx && y_hi != gly && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ly - ghost, lz - ghost), m_backrightup);
-
-    if (x_lo == 0 && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, std::make_pair(ghost, ly - ghost), lz - ghost), m_leftup);
-
-    if (x_lo == 0 && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, std::make_pair(ghost, ly - ghost), ghost - 1), m_leftdown);
-
-    if (x_lo == 0 && y_hi != gly)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ly - ghost, std::make_pair(ghost, lz - ghost)), m_backleft);
-
-    if (x_lo == 0 && y_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ghost - 1, std::make_pair(ghost, lz - ghost)), m_frontleft);
-
-    if (x_hi == glx && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, std::make_pair(ghost, ly - ghost), lz - ghost), m_rightup);
-
-    if (x_hi == glx && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, std::make_pair(ghost, ly - ghost), ghost - 1), m_rightdown);
-
-    if (x_hi == glx && y_hi != gly)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ly - ghost, std::make_pair(ghost, lz - ghost)), m_backright);
-
-    if (x_hi == glx && y_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ghost - 1, std::make_pair(ghost, lz - ghost)), m_frontright);
-
-    if (y_lo == 0 && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ghost - 1, lz - ghost), m_frontup);
-
-    if (y_lo == 0 && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ghost - 1, ghost - 1), m_frontdown);
-
-    if (y_lo == 0 && x_hi != glx)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ghost - 1, std::make_pair(ghost, lz - ghost)), m_frontright);
-
-    if (y_lo == 0 && x_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ghost - 1, std::make_pair(ghost, lz - ghost)), m_frontleft);
-
-    if (y_hi == gly && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ly - ghost, lz - ghost), m_backup);
-
-    if (y_hi == gly && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ly - ghost, ghost - 1), m_backdown);
-
-    if (y_hi == gly && x_hi != glx)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ly - ghost, std::make_pair(ghost, lz - ghost)), m_backright);
-
-    if (y_hi == gly && x_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ly - ghost, std::make_pair(ghost, lz - ghost)), m_backleft);
-
-    if (z_lo == 0 && y_hi != gly)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ly - ghost, ghost - 1), m_backdown);
-
-    if (z_lo == 0 && y_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ghost - 1, ghost - 1), m_backdown);
-
-    if (z_lo == 0 && x_hi != glx)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, std::make_pair(ghost, ly - ghost), ghost - 1), m_rightdown);
-
-    if (z_lo == 0 && x_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, std::make_pair(ghost, ly - ghost), ghost - 1), m_leftdown);
-
-    if (z_hi == glz && y_hi != gly)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ly - ghost, lz - ghost), m_backup);
-
-    if (z_hi == glz && y_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, std::make_pair(ghost, lx - ghost), ghost - 1, lz - ghost), m_frontup);
-
-    if (z_hi == glz && x_hi != glx)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, std::make_pair(ghost, ly - ghost), lz - ghost), m_rightup);
-
-    if (z_hi == glz && x_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, std::make_pair(ghost, ly - ghost), lz - ghost), m_leftup);
-
-    if (x_lo == 0 && y_lo != 0 && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ghost - 1, ghost - 1), m_frontleftdown);
-    if (x_lo == 0 && y_lo != 0 && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ghost - 1, ghost - 1), m_frontleftup);
-    if (x_lo == 0 && y_hi != gly && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ly - ghost, ghost - 1), m_backleftdown);
-    if (x_lo == 0 && y_hi != gly && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ly - ghost, ghost - 1), m_backleftup);
-
-    if (x_hi == glx && y_lo != 0 && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ghost - 1, lz - ghost), m_frontrightup);
-    if (x_hi == glx && y_lo != 0 && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ghost - 1, ghost - 1), m_frontrightdown);
-    if (x_hi == glx && y_hi != gly && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ly - ghost, lz - ghost), m_backrightup);
-    if (x_hi == glx && y_hi != gly && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ly - ghost, ghost - 1), m_backrightdown);
-
-    if (y_lo == 0 && x_lo != 0 && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ghost - 1, ghost - 1), m_frontleftdown);
-    if (y_lo == 0 && x_lo != 0 && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ghost - 1, lz - ghost), m_frontleftup);
-    if (y_lo == 0 && x_hi != glx && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ghost - 1, lz - ghost), m_frontrightup);
-    if (y_lo == 0 && x_hi != glx && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ghost - 1, ghost - 1), m_frontrightdown);
-
-    if (y_hi == gly && x_lo != 0 && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ly - ghost, ghost - 1), m_backleftdown);
-    if (y_hi == gly && x_lo != 0 && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ly - ghost, lz - ghost), m_backleftup);
-    if (y_hi == gly && x_hi != glx && z_hi != glz)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ly - ghost, lz - ghost), m_backrightup);
-    if (y_hi == gly && x_hi != glx && z_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ly - ghost, ghost - 1), m_backrightdown);
-
-    if (z_lo == 0 && x_lo != 0 && y_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ghost - 1, ghost - 1), m_frontleftdown);
-    if (z_lo == 0 && x_lo != 0 && y_hi != gly)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ghost - 1, lz - ghost), m_backleftdown);
-    if (z_lo == 0 && x_hi != glx && y_hi != gly)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ghost - 1, lz - ghost), m_backrightdown);
-    if (z_lo == 0 && x_hi != glx && y_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ghost - 1, ghost - 1), m_frontrightdown);
-
-    if (z_hi == glz && x_lo != 0 && y_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ly - ghost, ghost - 1), m_frontleftup);
-    if (z_hi == glz && x_lo != 0 && y_hi != gly)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, ghost - 1, ly - ghost, lz - ghost), m_backleftup);
-    if (z_hi == glz && x_hi != glx && y_hi != gly)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ly - ghost, lz - ghost), m_backrightup);
-    if (z_hi == glz && x_hi != glx && y_lo != 0)
-        Kokkos::deep_copy(Kokkos::subview(f, Kokkos::ALL, lx - ghost, ly - ghost, ghost - 1), m_frontrightup);
-}
 
 void LBM::Streaming()
 {
-    // left boundary free flow
+
+    // front boundary bounce back
+    if (y_lo == 0)
+    {
+        Kokkos::parallel_for(
+            "bcf", mdrange_policy3({0, ghost - 1, ghost - 1}, {q, lx - ghost + 1, lz - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int k) {
+                if (e(ii, 1) > 0)
+                {
+                    f(ii, i, l_s[1] - 1, k) = f(bb(ii), i + 2 * e(ii, 0), l_s[1] + 1, k + 2 * e(ii, 2));
+                }
+            });
+    }
+    // back boundary bounce back
+    Kokkos::fence();
+    if (y_hi == gly - 1)
+    {
+        Kokkos::parallel_for(
+            "bcb", mdrange_policy3({0, ghost - 1, ghost - 1}, {q, lx - ghost + 1, lz - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int k) {
+                if (e(ii, 1) < 0)
+                {
+                    f(ii, i, l_e[1], k) = f(bb(ii), i + 2 * e(ii, 0), l_e[1] - 2, k + 2 * e(ii, 2));
+                }
+            });
+    }
+    // bottom boundary bounce back
+    Kokkos::fence();
+    if (z_lo == 0)
+    {
+        Kokkos::parallel_for(
+            "bcd", mdrange_policy3({0, ghost - 1, ghost - 1}, {q, lx - ghost + 1, ly - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j) {
+                if (e(ii, 2) > 0)
+                {
+
+                    f(ii, i, j, l_s[2] - 1) = f(bb(ii), i + 2 * e(ii, 0), j + 2 * e(ii, 1), l_s[2] + 1);
+                }
+            });
+    }
+    // top boundary bounce back
+    Kokkos::fence();
+    if (z_hi == glz - 1)
+    {
+        Kokkos::parallel_for(
+            "bcu", mdrange_policy3({0, ghost - 1, ghost - 1}, {q, lx - ghost + 1, ly - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j) {
+                if (e(ii, 2) < 0)
+                {
+                    f(ii, i, j, l_e[2]) = f(bb(ii), i + 2 * e(ii, 0), j + 2 * e(ii, 1), l_e[2] - 2);
+                }
+            });
+    }
+    Kokkos::fence();
     if (x_lo == 0)
     {
         Kokkos::parallel_for(
+            "bcl", mdrange_policy3({0, ghost - 1, ghost - 1}, {q, ly - ghost + 1, lz - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int j, const int k) {
+                if (e(ii, 0) > 0)
+                {
+                    f(ii, ghost - 1, j, k) = f(ii, ghost, j, k);
+                }
+            });
+    }
+    Kokkos::fence();
+    // right boundary free flow
+    if (x_hi == glx - 1)
+    {
+        Kokkos::parallel_for(
+            "bcr", mdrange_policy3({0, ghost - 1, ghost - 1}, {q, ly - ghost + 1, lz - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int j, const int k) {
+                if (e(ii, 0) < 0)
+                {
+                    f(ii, l_e[0], j, k) = f(ii, l_e[0] + e(ii, 0), j + e(ii, 1), k + e(ii, 2));
+                }
+            });
+    }
+    Kokkos::fence();
+    // user boundary bounce back
+    Kokkos::parallel_for(
+        "usrbc", mdrange_policy4({0, ghost, ghost, ghost}, {q, lx - ghost, ly - ghost, lz - ghost}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j, const int k) {
+            if (usr(i, j, k) == 0 && usr(i + e(ii, 0), j + e(ii, 1), k + e(ii, 2)) == 1)
+            {
+                f(ii, i, j, k) = f(bb(ii), i + 2 * e(ii, 0), j + 2 * e(ii, 1), k + 2 * e(ii, 2));
+            }
+        });
+    Kokkos::fence();
+    // streaming process
+    Kokkos::parallel_for(
+        "stream1", mdrange_policy4({0, ghost, ghost, ghost}, {q, lx - ghost, ly - ghost, lz - ghost}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j, const int k) {
+            ft(ii, i, j, k) = f(ii, i - e(ii, 0), j - e(ii, 1), k - e(ii, 2));
+        });
+
+    Kokkos::fence();
+
+    Kokkos::parallel_for(
+        "stream2", mdrange_policy4({0, ghost, ghost, ghost}, {q, lx - ghost, ly - ghost, lz - ghost}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j, const int k) {
+            f(ii, i, j, k) = ft(ii, i, j, k);
+        });
+    Kokkos::fence();
+};
+
+void LBM::Boundary()
+{
+    /*if (x_lo == 0)
+    {
+        Kokkos::parallel_for(
             "bcl", mdrange_policy2({ghost - 1, ghost - 1}, {ly - ghost + 1, lz - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int j, const int k) {
-                f(1, ghost - 1, j, k) = f(1, ghost, j, k);
-                f(7, ghost - 1, j, k) = f(7, ghost, j, k);
-                f(9, ghost - 1, j, k) = f(9, ghost, j, k);
-                f(11, ghost - 1, j, k) = f(11, ghost, j, k);
-                f(13, ghost - 1, j, k) = f(13, ghost, j, k);
-                f(19, ghost - 1, j, k) = f(19, ghost, j, k);
-                f(21, ghost - 1, j, k) = f(21, ghost, j, k);
-                f(23, ghost - 1, j, k) = f(23, ghost, j, k);
-                f(25, ghost - 1, j, k) = f(25, ghost, j, k);
+                f(1, ghost - 1, j, k) = f(bb(1), ghost + 1, j + 2 * e(1, 1), k + 2 * e(1, 2));
+                f(7, ghost - 1, j, k) = f(bb(7), ghost + 1, j + 2 * e(7, 1), k + 2 * e(7, 2));
+                f(9, ghost - 1, j, k) = f(bb(9), ghost + 1, j + 2 * e(9, 1), k + 2 * e(9, 2));
+                f(11, ghost - 1, j, k) = f(bb(11), ghost + 1, j + 2 * e(11, 1), k + 2 * e(11, 2));
+                f(13, ghost - 1, j, k) = f(bb(13), ghost + 1, j + 2 * e(13, 1), k + 2 * e(13, 2));
+                f(19, ghost - 1, j, k) = f(bb(19), ghost + 1, j + 2 * e(19, 1), k + 2 * e(19, 2));
+                f(21, ghost - 1, j, k) = f(bb(21), ghost + 1, j + 2 * e(21, 1), k + 2 * e(21, 2));
+                f(23, ghost - 1, j, k) = f(bb(23), ghost + 1, j + 2 * e(23, 1), k + 2 * e(23, 2));
+                f(25, ghost - 1, j, k) = f(bb(25), ghost + 1, j + 2 * e(25, 1), k + 2 * e(25, 2));
             });
     }
     // right boundary free flow
-    if (x_hi == glx)
+    if (x_hi == glx - 1)
     {
         Kokkos::parallel_for(
             "bcr", mdrange_policy2({ghost - 1, ghost - 1}, {ly - ghost + 1, lz - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int j, const int k) {
-                f(2, lx - ghost, j, k) = f(2, lx - ghost - 1, j, k);
-                f(8, lx - ghost, j, k) = f(8, lx - ghost - 1, j - e(8, 1), k - e(8, 2));
-                f(10, lx - ghost, j, k) = f(10, lx - ghost - 1, j - e(10, 1), k - e(10, 2));
-                f(12, lx - ghost, j, k) = f(12, lx - ghost - 1, j - e(12, 1), k - e(12, 2));
-                f(14, lx - ghost, j, k) = f(14, lx - ghost - 1, j - e(14, 1), k - e(14, 2));
-                f(20, lx - ghost, j, k) = f(20, lx - ghost - 1, j - e(20, 1), k - e(20, 2));
-                f(22, lx - ghost, j, k) = f(22, lx - ghost - 1, j - e(22, 1), k - e(22, 2));
-                f(24, lx - ghost, j, k) = f(24, lx - ghost - 1, j - e(24, 1), k - e(24, 2));
-                f(26, lx - ghost, j, k) = f(26, lx - ghost - 1, j - e(26, 1), k - e(26, 2));
+                f(2, lx - ghost, j, k) = f(bb(2), lx - ghost - 2, j, k);
+                f(8, lx - ghost, j, k) = f(bb(8), lx - ghost - 2, j + 2 * e(8, 1), k + 2 * e(8, 2));
+                f(10, lx - ghost, j, k) = f(bb(10), lx - ghost - 2, j + 2 * e(10, 1), k + 2 * e(10, 2));
+                f(12, lx - ghost, j, k) = f(bb(12), lx - ghost - 2, j + 2 * e(12, 1), k + 2 * e(12, 2));
+                f(14, lx - ghost, j, k) = f(bb(14), lx - ghost - 2, j + 2 * e(14, 1), k + 2 * e(14, 2));
+                f(20, lx - ghost, j, k) = f(bb(20), lx - ghost - 2, j + 2 * e(20, 1), k + 2 * e(20, 2));
+                f(22, lx - ghost, j, k) = f(bb(22), lx - ghost - 2, j + 2 * e(22, 1), k + 2 * e(22, 2));
+                f(24, lx - ghost, j, k) = f(bb(24), lx - ghost - 2, j + 2 * e(24, 1), k + 2 * e(24, 2));
+                f(26, lx - ghost, j, k) = f(bb(26), lx - ghost - 2, j + 2 * e(26, 1), k + 2 * e(26, 2));
             });
     }
     // front boundary bounce back
@@ -1215,7 +420,7 @@ void LBM::Streaming()
             });
     }
     // back boundary bounce back
-    if (y_hi == gly)
+    if (y_hi == gly - 1)
     {
         Kokkos::parallel_for(
             "bcb", mdrange_policy2({ghost - 1, ghost - 1}, {lx - ghost + 1, lz - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int i, const int k) {
@@ -1247,46 +452,90 @@ void LBM::Streaming()
             });
     }
     // top boundary bounce back
-    if (z_hi == glz)
+    if (z_hi == glz - 1)
     {
         Kokkos::parallel_for(
             "bcu", mdrange_policy2({ghost - 1, ghost - 1}, {lx - ghost + 1, ly - ghost + 1}), KOKKOS_CLASS_LAMBDA(const int i, const int j) {
-                f(6, i, j, lz - ghost) = f(bb(6), i, j, lz - ghost - 2);
-                f(12, i, j, lz - ghost) = f(bb(12), i + 2 * e(12, 0), j + 2 * e(12, 1), lz - ghost - 2);
-                f(13, i, j, lz - ghost) = f(bb(13), i + 2 * e(13, 0), j + 2 * e(13, 1), lz - ghost - 2);
-                f(16, i, j, lz - ghost) = f(bb(16), i + 2 * e(16, 0), j + 2 * e(16, 1), lz - ghost - 2);
-                f(17, i, j, lz - ghost) = f(bb(17), i + 2 * e(17, 0), j + 2 * e(17, 1), lz - ghost - 2);
-                f(20, i, j, lz - ghost) = f(bb(20), i + 2 * e(20, 0), j + 2 * e(20, 1), lz - ghost - 2);
-                f(22, i, j, lz - ghost) = f(bb(22), i + 2 * e(22, 0), j + 2 * e(22, 1), lz - ghost - 2);
-                f(23, i, j, lz - ghost) = f(bb(23), i + 2 * e(23, 0), j + 2 * e(23, 1), lz - ghost - 2);
-                f(25, i, j, lz - ghost) = f(bb(25), i + 2 * e(25, 0), j + 2 * e(25, 1), lz - ghost - 2);
+                if (e)
+                    f(6, i, j, lz - ghost) = f(bb(6), i, j, lz - ghost - 2);
+                f(12, i, j, lz - ghost) = f(bb(12), i + 2 * e(12, 0), j + 2 * e(12, 1), lz - ghost - 2) - e(12, 0) * 6.0 * t(bb(12)) * u0;
+                f(13, i, j, lz - ghost) = f(bb(13), i + 2 * e(13, 0), j + 2 * e(13, 1), lz - ghost - 2) - e(13, 0) * 6.0 * t(bb(13)) * u0;
+                f(16, i, j, lz - ghost) = f(bb(16), i + 2 * e(16, 0), j + 2 * e(16, 1), lz - ghost - 2) - e(16, 0) * 6.0 * t(bb(16)) * u0;
+                f(17, i, j, lz - ghost) = f(bb(17), i + 2 * e(17, 0), j + 2 * e(17, 1), lz - ghost - 2) + e(17, 0) * 6.0 * t(bb(17)) * u0;
+                f(20, i, j, lz - ghost) = f(bb(20), i + 2 * e(20, 0), j + 2 * e(20, 1), lz - ghost - 2) - e(20, 0) * 6.0 * t(bb(20)) * u0;
+                f(22, i, j, lz - ghost) = f(bb(22), i + 2 * e(22, 0), j + 2 * e(22, 1), lz - ghost - 2) + e(22, 0) * 6.0 * t(bb(22)) * u0;
+                f(23, i, j, lz - ghost) = f(bb(23), i + 2 * e(23, 0), j + 2 * e(23, 1), lz - ghost - 2) + e(23, 0) * 6.0 * t(bb(23)) * u0;
+                f(25, i, j, lz - ghost) = f(bb(25), i + 2 * e(25, 0), j + 2 * e(25, 1), lz - ghost - 2) + e(25, 0) * 6.0 * t(bb(25)) * u0;
+            });
+    }*/
+    if (x_lo == 0)
+    {
+
+        Kokkos::parallel_for(
+            "1", mdrange_policy3({0, l_s[1] - 1, l_s[2] - 1}, {q, l_e[1] + 1, l_e[2] + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int j, const int k) {
+                if (e(ii, 0) > 0)
+                {
+                    f(ii, l_s[0] - 1, j, k) = f(bb(ii), l_s[0], j + e(ii, 1), k + e(ii, 2));
+                }
             });
     }
-    // user boundary bounce back
-    Kokkos::parallel_for(
-        "usrbc", mdrange_policy4({0, ghost, ghost, ghost}, {q, lx - ghost, ly - ghost, lz - ghost}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j, const int k) {
-            if (usr(i, j, k) == 0 && usr(i + e(ii, 0), j + e(ii, 1), k + e(ii, 2)) == 1)
-            {
-                f(ii, i, j, k) = f(bb(ii), i + 2 * e(ii, 0), j + 2 * e(ii, 1), k + 2 * e(ii, 2));
-            }
-        });
-    // streaming process
-    Kokkos::parallel_for(
-        "stream1", mdrange_policy4({0, ghost, ghost, ghost}, {q, lx - ghost, ly - ghost, lz - ghost}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j, const int k) {
-            ft(ii, i, j, k) = f(ii, i - e(ii, 0), j - e(ii, 1), k - e(ii, 2));
-        });
+    if (x_hi == glx - 1)
+    {
 
-    Kokkos::fence();
+        Kokkos::parallel_for(
+            "2", mdrange_policy3({0, l_s[1] - 1, l_s[2] - 1}, {q, l_e[1] + 1, l_e[2] + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int j, const int k) {
+                if (e(ii, 0) < 0)
+                {
+                    f(ii, l_e[0], j, k) = f(bb(ii), l_e[0] - 1, j + e(ii, 1), k + e(ii, 2));
+                }
+            });
+    }
 
-    Kokkos::parallel_for(
-        "stream2", mdrange_policy4({0, ghost, ghost, ghost}, {q, lx - ghost, ly - ghost, lz - ghost}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j, const int k) {
-            f(ii, i, j, k) = ft(ii, i, j, k);
-        });
-};
+    // front boundary bounce back
+    if (y_lo == 0)
+    {
+        Kokkos::parallel_for(
+            "3", mdrange_policy3({0, l_s[0] - 1, l_s[2] - 1}, {q, l_e[0] + 1, l_e[2] + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int k) {
+                if (e(ii, 1) > 0)
+                {
+                    f(ii, i, l_s[1] - 1, k) = f(bb(ii), i + e(ii, 0), l_s[1], k + e(ii, 2));
+                }
+            });
+    }
 
+    if (y_hi == gly - 1)
+    {
+        Kokkos::parallel_for(
+            "4", mdrange_policy3({0, l_s[0] - 1, l_s[2] - 1}, {q, l_e[0] + 1, l_e[2] + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int k) {
+                if (e(ii, 1) < 0)
+                {
+                    f(ii, i, l_e[1], k) = f(bb(ii), i + e(ii, 0), l_e[1] - 1, k + e(ii, 2));
+                }
+            });
+    }
+    if (z_lo == 0)
+    {
+        Kokkos::parallel_for(
+            "5", mdrange_policy3({0, l_s[0] - 1, l_s[1] - 1}, {q, l_e[0] + 1, l_e[1] + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j) {
+                if (e(ii, 2) > 0)
+                {
+                    f(ii, i, j, l_s[2] - 1) = f(bb(ii), i + e(ii, 0), j + e(ii, 1), l_s[2]);
+                }
+            });
+    }
+    if (z_hi == glz - 1)
+    {
+        Kokkos::parallel_for(
+            "6", mdrange_policy3({0, l_s[0] - 1, l_s[1] - 1}, {q, l_e[0] + 1, l_e[1] + 1}), KOKKOS_CLASS_LAMBDA(const int ii, const int i, const int j) {
+                if (e(ii, 2) < 0)
+                {
+                    f(ii, i, j, l_e[2]) = f(bb(ii), i + e(ii, 0), j + e(ii, 1), l_e[2] - 1) - e(bb(ii), 0) * 6.0 * t(bb(ii)) * u0;
+                }
+            });
+    }
+}
 void LBM::Update()
 {
-    // update macroscopic value
     Kokkos::parallel_for(
         "initv", mdrange_policy3({0, 0, 0}, {lx, ly, lz}), KOKKOS_CLASS_LAMBDA(const int i, const int j, const int k) {
             ua(i, j, k) = 0;
@@ -1301,7 +550,7 @@ void LBM::Update()
         {
             for (int i = ghost; i < lx - ghost; i++)
             {
-                for (int ii = 0; ii < 27; ii++)
+                for (int ii = 0; ii < q; ii++)
                 {
                     p(i, j, k) = p(i, j, k) + f(ii, i, j, k) / 3.0;
 
@@ -1320,7 +569,7 @@ void LBM::Update()
                     va(ghost, j, k) = 0.0;
                     wa(ghost, j, k) = 0.0;
                 }
-                if (x_hi == glx)
+                if (x_hi == glx - 1)
                 {
                     p(lx - ghost - 1, j, k) = 0.0;
                 }
@@ -1345,88 +594,101 @@ void LBM::MPIoutput(int n)
     double fp;
     // min max
     double umin, umax, wmin, wmax, vmin, vmax, pmin, pmax;
+    double uumin, uumax, wwmin, wwmax, vvmin, vvmax, ppmin, ppmax;
     // transfer
     double *uu, *vv, *ww, *pp, *xx, *yy, *zz;
     int start[3];
-    uu = (double *)malloc(ex * ey * ez * sizeof(double));
-    vv = (double *)malloc(ex * ey * ez * sizeof(double));
-    ww = (double *)malloc(ex * ey * ez * sizeof(double));
-    pp = (double *)malloc(ex * ey * ez * sizeof(double));
-    xx = (double *)malloc(ex * ey * ez * sizeof(double));
-    yy = (double *)malloc(ex * ey * ez * sizeof(double));
-    zz = (double *)malloc(ex * ey * ez * sizeof(double));
+    uu = (double *)malloc(l_l[0] * l_l[1] * l_l[2] * sizeof(double));
+    vv = (double *)malloc(l_l[0] * l_l[1] * l_l[2] * sizeof(double));
+    ww = (double *)malloc(l_l[0] * l_l[1] * l_l[2] * sizeof(double));
+    pp = (double *)malloc(l_l[0] * l_l[1] * l_l[2] * sizeof(double));
+    xx = (double *)malloc(l_l[0] * l_l[1] * l_l[2] * sizeof(double));
+    yy = (double *)malloc(l_l[0] * l_l[1] * l_l[2] * sizeof(double));
+    zz = (double *)malloc(l_l[0] * l_l[1] * l_l[2] * sizeof(double));
 
-    for (int k = 0; k < ez; k++)
+    for (int k = 0; k < l_l[2]; k++)
     {
-        for (int j = 0; j < ey; j++)
+        for (int j = 0; j < l_l[1]; j++)
         {
-            for (int i = 0; i < ex; i++)
+            for (int i = 0; i < l_l[0]; i++)
             {
 
-                uu[i + j * ex + k * ey * ex] = ua(i + ghost, j + ghost, k + ghost);
-                vv[i + j * ex + k * ey * ex] = va(i + ghost, j + ghost, k + ghost);
-                ww[i + j * ex + k * ey * ex] = wa(i + ghost, j + ghost, k + ghost);
-                pp[i + j * ex + k * ey * ex] = p(i + ghost, j + ghost, k + ghost);
-                xx[i + j * ex + k * ey * ex] = (double)4.0 * (x_lo + i) / glx;
-                yy[i + j * ex + k * ey * ex] = (double)(y_lo + j) / gly;
-                zz[i + j * ex + k * ey * ex] = (double)(z_lo + k) / glz;
+                uu[i + j * l_l[0] + k * l_l[1] * l_l[0]] = ua(i + ghost, j + ghost, k + ghost);
+                vv[i + j * l_l[0] + k * l_l[1] * l_l[0]] = va(i + ghost, j + ghost, k + ghost);
+                ww[i + j * l_l[0] + k * l_l[1] * l_l[0]] = wa(i + ghost, j + ghost, k + ghost);
+                pp[i + j * l_l[0] + k * l_l[1] * l_l[0]] = p(i + ghost, j + ghost, k + ghost);
+                xx[i + j * l_l[0] + k * l_l[1] * l_l[0]] = (double)4.0 * (x_lo + i) / (glx - 1);
+                yy[i + j * l_l[0] + k * l_l[1] * l_l[0]] = (double)(y_lo + j) / (gly - 1);
+                zz[i + j * l_l[0] + k * l_l[1] * l_l[0]] = (double)(z_lo + k) / (glz - 1);
             }
         }
     }
 
     parallel_reduce(
-        " Label", mdrange_policy3({ghost, ghost, ghost}, {lx - ghost, ly - ghost, lz - ghost}),
+        " Label", mdrange_policy3({ghost, ghost, ghost}, {l_e[0], l_e[1], l_e[2]}),
         KOKKOS_CLASS_LAMBDA(const int i, const int j, const int k, double &valueToUpdate) {
          double my_value = ua(i,j,k);
          if(my_value > valueToUpdate ) valueToUpdate = my_value; }, Kokkos ::Max<double>(umax));
-
+    Kokkos::fence();
     parallel_reduce(
-        " Label", mdrange_policy3({ghost, ghost, ghost}, {lx - ghost, ly - ghost, lz - ghost}),
+        " Label", mdrange_policy3({ghost, ghost, ghost}, {l_e[0], l_e[1], l_e[2]}),
         KOKKOS_CLASS_LAMBDA(const int i, const int j, const int k, double &valueToUpdate) {
          double my_value = va(i,j,k);
          if(my_value > valueToUpdate ) valueToUpdate = my_value; }, Kokkos ::Max<double>(vmax));
-
+    Kokkos::fence();
     parallel_reduce(
-        " Label", mdrange_policy3({ghost, ghost, ghost}, {lx - ghost, ly - ghost, lz - ghost}),
+        " Label", mdrange_policy3({ghost, ghost, ghost}, {l_e[0], l_e[1], l_e[2]}),
         KOKKOS_CLASS_LAMBDA(const int i, const int j, const int k, double &valueToUpdate) {
          double my_value = wa(i,j,k);
          if(my_value > valueToUpdate ) valueToUpdate = my_value; }, Kokkos ::Max<double>(wmax));
-
+    Kokkos::fence();
     parallel_reduce(
-        " Label", mdrange_policy3({ghost, ghost, ghost}, {lx - ghost, ly - ghost, lz - ghost}),
+        " Label", mdrange_policy3({ghost, ghost, ghost}, {l_e[0], l_e[1], l_e[2]}),
         KOKKOS_CLASS_LAMBDA(const int i, const int j, const int k, double &valueToUpdate) {
          double my_value = p(i,j,k);
          if(my_value > valueToUpdate ) valueToUpdate = my_value; }, Kokkos ::Max<double>(pmax));
-
+    Kokkos::fence();
     parallel_reduce(
-        " Label", mdrange_policy3({ghost, ghost, ghost}, {lx - ghost, ly - ghost, lz - ghost}),
+        " Label", mdrange_policy3({ghost, ghost, ghost}, {l_e[0], l_e[1], l_e[2]}),
         KOKKOS_CLASS_LAMBDA(const int i, const int j, const int k, double &valueToUpdate) {
          double my_value = ua(i,j,k);
          if(my_value < valueToUpdate ) valueToUpdate = my_value; }, Kokkos ::Min<double>(umin));
-
+    Kokkos::fence();
     parallel_reduce(
-        " Label", mdrange_policy3({ghost, ghost, ghost}, {lx - ghost, ly - ghost, lz - ghost}),
+        " Label", mdrange_policy3({ghost, ghost, ghost}, {l_e[0], l_e[1], l_e[2]}),
         KOKKOS_CLASS_LAMBDA(const int i, const int j, const int k, double &valueToUpdate) {
          double my_value = va(i,j,k);
          if(my_value < valueToUpdate ) valueToUpdate = my_value; }, Kokkos ::Min<double>(vmin));
-
+    Kokkos::fence();
     parallel_reduce(
-        " Label", mdrange_policy3({ghost, ghost, ghost}, {lx - ghost, ly - ghost, lz - ghost}),
+        " Label", mdrange_policy3({ghost, ghost, ghost}, {l_e[0], l_e[1], l_e[2]}),
         KOKKOS_CLASS_LAMBDA(const int i, const int j, const int k, double &valueToUpdate) {
          double my_value = wa(i,j,k);
          if(my_value < valueToUpdate ) valueToUpdate = my_value; }, Kokkos ::Min<double>(wmin));
-
+    Kokkos::fence();
     parallel_reduce(
-        " Label", mdrange_policy3({ghost, ghost, ghost}, {lx - ghost, ly - ghost, lz - ghost}),
+        " Label", mdrange_policy3({ghost, ghost, ghost}, {l_e[0], l_e[1], l_e[2]}),
         KOKKOS_CLASS_LAMBDA(const int i, const int j, const int k, double &valueToUpdate) {
          double my_value = p(i,j,k);
          if(my_value < valueToUpdate ) valueToUpdate = my_value; }, Kokkos ::Min<double>(pmin));
-
+    Kokkos::fence();
     std::string str1 = "output" + std::to_string(n) + ".plt";
     const char *na = str1.c_str();
     std::string str2 = "#!TDV112";
     const char *version = str2.c_str();
     MPI_File_open(MPI_COMM_WORLD, na, MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &fh);
+
+    MPI_Reduce(&umin, &uumin, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&umax, &uumax, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    MPI_Reduce(&vmin, &vvmin, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&vmax, &vvmax, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    MPI_Reduce(&wmin, &wwmin, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&wmax, &wwmax, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    MPI_Reduce(&pmin, &ppmin, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&pmax, &ppmax, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (comm.me == 0)
     {
@@ -1580,21 +842,21 @@ void LBM::MPIoutput(int n)
         MPI_File_write(fh, &fp, 1, MPI_DOUBLE, &status);
         fp = 1.0;
         MPI_File_write(fh, &fp, 1, MPI_DOUBLE, &status);
-        fp = umin;
+        fp = uumin;
         MPI_File_write(fh, &fp, 1, MPI_DOUBLE, &status);
-        fp = umax;
+        fp = uumax;
         MPI_File_write(fh, &fp, 1, MPI_DOUBLE, &status);
-        fp = vmin;
+        fp = vvmin;
         MPI_File_write(fh, &fp, 1, MPI_DOUBLE, &status);
-        fp = vmax;
+        fp = vvmax;
         MPI_File_write(fh, &fp, 1, MPI_DOUBLE, &status);
-        fp = wmin;
+        fp = wwmin;
         MPI_File_write(fh, &fp, 1, MPI_DOUBLE, &status);
-        fp = wmax;
+        fp = wwmax;
         MPI_File_write(fh, &fp, 1, MPI_DOUBLE, &status);
-        fp = pmin;
+        fp = ppmin;
         MPI_File_write(fh, &fp, 1, MPI_DOUBLE, &status);
-        fp = pmax;
+        fp = ppmax;
         MPI_File_write(fh, &fp, 1, MPI_DOUBLE, &status);
 
         // 220 + 14 * 8 = 332
@@ -1602,14 +864,12 @@ void LBM::MPIoutput(int n)
 
     offset = 332;
 
-    int loclen[3] = {ex, ey, ez};
     int glolen[3] = {glx, gly, glz};
     int iniarr[3] = {0, 0, 0};
     int localstart[3] = {x_lo, y_lo, z_lo};
+    MPI_Type_create_subarray(dim, glolen, l_l, localstart, MPI_ORDER_FORTRAN, MPI_DOUBLE, &DATATYPE);
 
-    MPI_Type_create_subarray(dim, glolen, loclen, localstart, MPI_ORDER_FORTRAN, MPI_DOUBLE, &DATATYPE);
-
-    // MPI_Type_commit(&DATATYPE);
+    MPI_Type_commit(&DATATYPE);
 
     MPI_Type_contiguous(7, DATATYPE, &FILETYPE);
 
@@ -1617,19 +877,19 @@ void LBM::MPIoutput(int n)
 
     MPI_File_set_view(fh, offset, MPI_DOUBLE, FILETYPE, "native", MPI_INFO_NULL);
 
-    MPI_File_write_all(fh, xx, ex * ey * ez, MPI_DOUBLE, MPI_STATUS_IGNORE);
+    MPI_File_write_all(fh, xx, l_l[0] * l_l[1] * l_l[2], MPI_DOUBLE, MPI_STATUS_IGNORE);
 
-    MPI_File_write_all(fh, yy, ex * ey * ez, MPI_DOUBLE, MPI_STATUS_IGNORE);
+    MPI_File_write_all(fh, yy, l_l[0] * l_l[1] * l_l[2], MPI_DOUBLE, MPI_STATUS_IGNORE);
 
-    MPI_File_write_all(fh, zz, ex * ey * ez, MPI_DOUBLE, MPI_STATUS_IGNORE);
+    MPI_File_write_all(fh, zz, l_l[0] * l_l[1] * l_l[2], MPI_DOUBLE, MPI_STATUS_IGNORE);
 
-    MPI_File_write_all(fh, uu, ex * ey * ez, MPI_DOUBLE, MPI_STATUS_IGNORE);
+    MPI_File_write_all(fh, uu, l_l[0] * l_l[1] * l_l[2], MPI_DOUBLE, MPI_STATUS_IGNORE);
 
-    MPI_File_write_all(fh, vv, ex * ey * ez, MPI_DOUBLE, MPI_STATUS_IGNORE);
+    MPI_File_write_all(fh, vv, l_l[0] * l_l[1] * l_l[2], MPI_DOUBLE, MPI_STATUS_IGNORE);
 
-    MPI_File_write_all(fh, ww, ex * ey * ez, MPI_DOUBLE, MPI_STATUS_IGNORE);
+    MPI_File_write_all(fh, ww, l_l[0] * l_l[1] * l_l[2], MPI_DOUBLE, MPI_STATUS_IGNORE);
 
-    MPI_File_write_all(fh, pp, ex * ey * ez, MPI_DOUBLE, MPI_STATUS_IGNORE);
+    MPI_File_write_all(fh, pp, l_l[0] * l_l[1] * l_l[2], MPI_DOUBLE, MPI_STATUS_IGNORE);
 
     MPI_File_close(&fh);
 
@@ -1652,16 +912,16 @@ void LBM::Output(int n)
     outfile.open(str + ".dat", std::ios::out);
 
     outfile << "variables=x,y,z,f" << std::endl;
-    outfile << "zone I=" << lx - 2 << ",J=" << ly - 2 << ",K=" << lz - 2 << std::endl;
+    outfile << "zone I=" << lx - 6 << ",J=" << ly - 6 << ",K=" << lz - 6 << std::endl;
 
-    for (int k = 1; k < lz - 1; k++)
+    for (int k = 3; k < lz - 3; k++)
     {
-        for (int j = 1; j < ly - 1; j++)
+        for (int j = 3; j < ly - 3; j++)
         {
-            for (int i = 1; i < lx - 1; i++)
+            for (int i = 3; i < lx - 3; i++)
             {
 
-                outfile << std::setprecision(8) << setiosflags(std::ios::left) << x_lo + i - 2 << " " << y_lo + j - 2 << " " << z_lo + k - 2 << " " << f(1, i, j, k) << std::endl;
+                outfile << std::setprecision(8) << setiosflags(std::ios::left) << x_lo + i - 3 << " " << y_lo + j - 3 << " " << z_lo + k - 3 << " " << f(1, i, j, k) << std::endl;
             }
         }
     }
