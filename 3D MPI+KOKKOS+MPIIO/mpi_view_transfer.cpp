@@ -83,7 +83,7 @@ void LBM::setup_subdomain()
 void LBM::pack()
 {
     // q faces
-    if (y_hi == gly - 1)
+    if (y_lo != 0)
         for (int k = 0; k < lz; k++)
         {
             for (int i = 0; i < lx; i++)
@@ -110,7 +110,7 @@ void LBM::pack()
             }
         }
 
-    if (z_hi == glz - 1)
+    if (z_lo != 0)
         for (int j = 0; j < ly; j++)
         {
             for (int i = 0; i < lx; i++)
@@ -123,7 +123,7 @@ void LBM::pack()
             }
         }
 
-    if (z_lo == 0)
+    if (z_hi != glz - 1)
         for (int j = 0; j < ly; j++)
         {
             for (int i = 0; i < lx; i++)
@@ -136,7 +136,7 @@ void LBM::pack()
             }
         }
 
-    if (x_hi == glx - 1)
+    if (x_lo != 0)
         for (int k = 0; k < lz; k++)
         {
             for (int j = 0; j < ly; j++)
@@ -150,7 +150,7 @@ void LBM::pack()
             }
         }
 
-    if (x_lo == 0)
+    if (x_hi != glx - 1)
         for (int k = 0; k < lz; k++)
         {
             for (int j = 0; j < ly; j++)
@@ -382,7 +382,7 @@ void LBM::exchange()
 {
     // 6 faces
     int mar = 1;
-    MPI_Request ttttt, ttttt1;
+
     int received;
     if (y_lo != 0)
     {
@@ -397,9 +397,7 @@ void LBM::exchange()
     mar = 2;
     if (y_hi != gly - 1)
     {
-
-        MPI_Isend(m_backout, q * lx * lz, MPI_DOUBLE, comm.back, mar, comm.comm, &ttttt1);
-        MPI_Wait(&ttttt1, MPI_STATUS_IGNORE);
+        MPI_Send(m_backout, q * lx * lz, MPI_DOUBLE, comm.back, mar, comm.comm);
     }
 
     if (y_lo != 0)
@@ -613,7 +611,7 @@ void LBM::unpack()
         }
     }
 
-    if (y_lo == 0)
+    if (y_hi != gly - 1)
     {
         for (int k = 0; k < lz; k++)
         {
@@ -628,7 +626,7 @@ void LBM::unpack()
         }
     }
 
-    if (z_lo == 0)
+    if (z_hi != glz - 1)
     {
         for (int j = 0; j < ly; j++)
         {
@@ -658,7 +656,7 @@ void LBM::unpack()
         }
     }
 
-    if (x_hi == glx - 1)
+    if (x_lo != 0)
         for (int k = 0; k < lz; k++)
         {
             for (int j = 0; j < ly; j++)
@@ -672,7 +670,7 @@ void LBM::unpack()
             }
         }
 
-    if (x_lo == 0)
+    if (x_hi != glx - 1)
         for (int k = 0; k < lz; k++)
         {
             for (int j = 0; j < ly; j++)
@@ -724,14 +722,14 @@ void LBM::unpack()
         }
     }
 
-    if (x_hi != glx - 1 && z_hi != glz - 1)
+    if (x_lo != 0 && z_lo != 0)
     {
         for (int j = 0; j < l_l[1]; j++)
         {
             for (int ii = 0; ii < q; ii++)
             {
 
-                f(ii, l_e[0], j + l_s[1], l_e[2]) = m_rightup[ii + j * q];
+                f(ii, l_s[0] - 1, j + l_s[1], l_s[2] - 1) = m_leftdown[ii + j * q];
             }
         }
     }
