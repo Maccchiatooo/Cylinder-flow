@@ -420,7 +420,6 @@ void LBM::MPIoutput(int n)
 {
     // MPI_IO
     MPI_File fh;
-    MPIO_Request request;
     MPI_Status status;
     MPI_Offset offset = 0;
 
@@ -434,7 +433,6 @@ void LBM::MPIoutput(int n)
     double uumin, uumax, wwmin, wwmax, vvmin, vvmax, ppmin, ppmax;
     // transfer
     double *uu, *vv, *ww, *pp, *xx, *yy, *zz;
-    int start[3];
     uu = (double *)malloc(l_l[0] * l_l[1] * l_l[2] * sizeof(double));
     vv = (double *)malloc(l_l[0] * l_l[1] * l_l[2] * sizeof(double));
     ww = (double *)malloc(l_l[0] * l_l[1] * l_l[2] * sizeof(double));
@@ -702,7 +700,6 @@ void LBM::MPIoutput(int n)
     offset = 332;
 
     int glolen[3] = {glx, gly, glz};
-    int iniarr[3] = {0, 0, 0};
     int localstart[3] = {x_lo, y_lo, z_lo};
     MPI_Type_create_subarray(dim, glolen, l_l, localstart, MPI_ORDER_FORTRAN, MPI_DOUBLE, &DATATYPE);
 
