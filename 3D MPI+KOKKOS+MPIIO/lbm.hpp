@@ -26,9 +26,9 @@ typedef Kokkos::MDRangePolicy<Kokkos::Rank<2>> mdrange_policy2;
 typedef Kokkos::MDRangePolicy<Kokkos::Rank<3>> mdrange_policy3;
 typedef Kokkos::MDRangePolicy<Kokkos::Rank<4>> mdrange_policy4;
 
-using buffer_t = Kokkos::View<double ***, Kokkos::LayoutLeft, Kokkos::CudaUVMSpace>;
-using buffer_ut = Kokkos::View<double **, Kokkos::LayoutLeft, Kokkos::CudaUVMSpace>;
-using buffer_st = Kokkos::View<double *, Kokkos::LayoutLeft, Kokkos::CudaUVMSpace>;
+using buffer_t = Kokkos::View<double ***, Kokkos::LayoutLeft, Kokkos::HostSpace>;
+using buffer_ut = Kokkos::View<double **, Kokkos::LayoutLeft, Kokkos::HostSpace>;
+using buffer_st = Kokkos::View<double *, Kokkos::LayoutLeft, Kokkos::HostSpace>;
 
 struct CommHelper
 {
@@ -121,14 +121,14 @@ struct LBM
     double rho0, mu, cs2, tau0, u0;
 
     // 6 faces
-    double *m_left, *m_right, *m_down, *m_up, *m_front, *m_back;
-    double *m_leftout, *m_rightout, *m_downout, *m_upout, *m_frontout, *m_backout;
+    buffer_t m_left, m_right, m_down, m_up, m_front, m_back;
+    buffer_t m_leftout, m_rightout, m_downout, m_upout, m_frontout, m_backout;
     // 12 edges
-    double *m_leftup, *m_rightup, *m_leftdown, *m_rightdown, *m_frontup, *m_backup, *m_frontdown, *m_backdown, *m_frontleft, *m_backleft, *m_frontright, *m_backright;
-    double *m_leftupout, *m_rightupout, *m_leftdownout, *m_rightdownout, *m_frontupout, *m_backupout, *m_frontdownout, *m_backdownout, *m_frontleftout, *m_backleftout, *m_frontrightout, *m_backrightout;
+    buffer_ut m_leftup, m_rightup, m_leftdown, m_rightdown, m_frontup, m_backup, m_frontdown, m_backdown, m_frontleft, m_backleft, m_frontright, m_backright;
+    buffer_ut m_leftupout, m_rightupout, m_leftdownout, m_rightdownout, m_frontupout, m_backupout, m_frontdownout, m_backdownout, m_frontleftout, m_backleftout, m_frontrightout, m_backrightout;
     // 8 points
-    double *m_frontleftup, *m_frontrightup, *m_frontleftdown, *m_frontrightdown, *m_backleftup, *m_backleftdown, *m_backrightup, *m_backrightdown;
-    double *m_frontleftupout, *m_frontrightupout, *m_frontleftdownout, *m_frontrightdownout, *m_backleftupout, *m_backleftdownout, *m_backrightupout, *m_backrightdownout;
+    buffer_st m_frontleftup, m_frontrightup, m_frontleftdown, m_frontrightdown, m_backleftup, m_backleftdown, m_backrightup, m_backrightdown;
+    buffer_st m_frontleftupout, m_frontrightupout, m_frontleftdownout, m_frontrightdownout, m_backleftupout, m_backleftdownout, m_backrightupout, m_backrightdownout;
     // particle distribution eqution
     Kokkos::View<double ****, Kokkos::CudaUVMSpace> f, ft, fb;
     // macro scopic equation
