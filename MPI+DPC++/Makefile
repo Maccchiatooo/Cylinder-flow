@@ -13,19 +13,16 @@ main: System.o lbm.o mpi_exchange.o main.o
 main.o: main.cpp
 	$(MPICOMP) -c main.cpp
 
-System.o: System.cpp
+System.o: System.hpp System.cpp
 	$(MPICOMP) -c System.cpp
 
-lbm.o: lbm.cpp
+lbm.o: lbm.hpp lbm.cpp
 	$(MPICOMP) -c lbm.cpp
 
-mpi_exchange.o: System.cpp
-	$(MPICOMP) -c exchange.cpp
+mpi_exchange.o: mpi_exchange.cpp 
+	$(MPICOMP) -c mpi_exchange.cpp
 
 run: main
 	mpirun -np 2 ./main
 
 .PHONY: clean
-
-clean:
-	rm -f main *.o
