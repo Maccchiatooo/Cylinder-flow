@@ -1,0 +1,239 @@
+#ifndef _LBM_H_
+#define _LBM_H_
+
+#include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <cstdlib>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <time.h>
+#include <CL/sycl.hpp>
+#include <mpi.h>
+using namespace sycl;
+#define q 27
+#define dim 3
+#define ghost 3
+struct CommHelper
+{
+
+    MPI_Comm comm;
+    int rx, ry, rz;
+    int me;
+    int px, py, pz;
+    int up, down, left, right, front, back, frontup, frontdown, frontleft, frontright, frontleftup, frontleftdown, frontrightup, frontrightdown, backup, backdown, backleft, backright, backleftup, backrightup, backleftdown, backrightdown, leftup, leftdown, rightup, rightdown;
+
+    CommHelper(MPI_Comm comm_)
+    {
+        comm = comm_;
+        int nranks;
+        MPI_Comm_size(comm, &nranks);
+        MPI_Comm_rank(comm, &me);
+
+        rx = std::pow(1.0 * nranks, 1.0 / 3.0);
+        while (nranks % rx != 0)
+            rx++;
+
+        rz = std::sqrt(1.0 * (nranks / rx));
+        while ((nranks / rx) % rz != 0)
+            rz++;
+
+        ry = nranks / rx / rz;
+
+        // printf("rx=%i,ry=%i,rz=%i\n", rx, ry, rz);
+        px = me % rx;
+        pz = (me / rx) % rz;
+        py = (me / rx / rz);
+
+        left = px == 0 ? -1 : me - 1;
+        leftup = (px == 0 || pz == rz - 1) ? -1 : me - 1 + rx;
+        rightup = (px == rx - 1 || pz == rz - 1) ? -1 : me + 1 + rx;
+        leftdown = (px == 0 || pz == 0) ? -1 : me - 1 - rx;
+        rightdown = (px == rx - 1 || pz == 0) ? -1 : me + 1 - rx;
+        right = px == rx - 1 ? -1 : me + 1;
+        down = pz == 0 ? -1 : me - rx;
+        up = pz == rz - 1 ? -1 : me + rx;
+
+        front = py == 0 ? -1 : me - rx * rz;
+        frontup = (py == 0 || pz == rz - 1) ? -1 : me - rx * rz + rx;
+        frontdown = (py == 0 || pz == 0) ? -1 : me - rx * rz - rx;
+        frontleft = (py == 0 || px == 0) ? -1 : me - rx * rz - 1;
+        frontright = (py == 0 || px == rx - 1) ? -1 : me - rx * rz + 1;
+        frontleftdown = (py == 0 || px == 0 || pz == 0) ? -1 : me - rx * rz - rx - 1;
+        frontrightdown = (py == 0 || px == rx - 1 || pz == 0) ? -1 : me - rx * rz - rx + 1;
+        frontrightup = (py == 0 || px == rx - 1 || pz == rz - 1) ? -1 : me - rx * rz + rx + 1;
+        frontleftup = (py == 0 || px == 0 || pz == rz - 1) ? -1 : me - rx * rz + rx - 1;
+
+        back = py == ry - 1 ? -1 : me + rx * rz;
+        backup = (py == ry - 1 || pz == rz - 1) ? -1 : me + rx * rz + rx;
+        backdown = (py == ry - 1 || pz == 0) ? -1 : me + rx * rz - rx;
+        backleft = (py == ry - 1 || px == 0) ? -1 : me + rx * rz - 1;
+        backright = (py == ry - 1 || px == rx - 1) ? -1 : me + rx * rz + 1;
+        backleftdown = (py == ry - 1 || px == 0 || pz == 0) ? -1 : me + rx * rz - rx - 1;
+        backrightdown = (py == ry - 1 || px == rx - 1 || pz == 0) ? -1 : me + rx * rz - rx + 1;
+        backrightup = (py == ry - 1 || px == rx - 1 || pz == rz - 1) ? -1 : me + rx * rz + rx + 1;
+        backleftup = (py == ry - 1 || px == 0 || pz == rz - 1) ? -1 : me + rx * rz + rx - 1;
+
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+    template <class ViewType>
+    void isend_irecv(int partner, ViewType send_buffer, ViewType recv_buffer, MPI_Request *request_send, MPI_Request *request_recv)
+    {
+        MPI_Irecv(recv_buffer.data(), recv_buffer.size(), MPI_DOUBLE, partner, 1, comm, request_recv);
+        MPI_Isend(send_buffer.data(), send_buffer.size(), MPI_DOUBLE, partner, 1, comm, request_send);
+    }
+};
+struct LBM
+{
+
+    CommHelper comm;
+
+    int mpi_active_requests;
+
+    int glx;
+    int gly;
+    int glz;
+
+    size_t rdx;
+    size_t rdy;
+    size_t rdz;
+    size_t ldx;
+    size_t ldy;
+    size_t ldz;
+
+    // exact nodes
+    // 256/1,64/2,64/1
+    int ex;
+    int ey;
+    int ez;
+    // include ghost nodes
+    // 256+2*3,32+2*3,64+2*3
+    int lx;
+    int ly;
+    int lz;
+    // 3,3,3  262,35,67
+    // 256,32,64
+    int l_s[3];
+    int l_e[3];
+    int l_l[3];
+
+    int x_lo = 0;
+    int x_hi = 0;
+    int y_lo = 0;
+    int y_hi = 0;
+    int z_lo = 0;
+    int z_hi = 0;
+    double rho0;
+    double mu;
+    double cs2;
+    double tau0;
+    double u0;
+
+    std::array<int, q * dim> e;
+    std::array<double, q> t;
+
+    double *m_left, *m_right, *m_down, *m_up, *m_front, *m_back;
+    double *m_leftout, *m_rightout, *m_downout, *m_upout, *m_frontout, *m_backout;
+    // 12 edges
+    double *m_leftup, *m_rightup, *m_leftdown, *m_rightdown, *m_frontup, *m_backup, *m_frontdown, *m_backdown, *m_frontleft, *m_backleft, *m_frontright, *m_backright;
+    double *m_leftupout, *m_rightupout, *m_leftdownout, *m_rightdownout, *m_frontupout, *m_backupout, *m_frontdownout, *m_backdownout, *m_frontleftout, *m_backleftout, *m_frontrightout, *m_backrightout;
+    // 8 points
+    double *m_frontleftup, *m_frontrightup, *m_frontleftdown, *m_frontrightdown, *m_backleftup, *m_backleftdown, *m_backrightup, *m_backrightdown;
+    double *m_frontleftupout, *m_frontrightupout, *m_frontleftdownout, *m_frontrightdownout, *m_backleftupout, *m_backleftdownout, *m_backrightupout, *m_backrightdownout;
+
+    double *f, *ft, *fb, *ua, *va, *wa, *rho, *p;
+    int *usr, *ran, *bb;
+    queue Q{};
+
+    LBM(MPI_Comm comm_, int sx, int sy, int sz, double &tau, double &rho0, double &u0) : comm(comm_), glx(sx), gly(sy), glz(sz), tau0(tau), rho0(rho0), u0(u0)
+    {
+
+        l_l[0] = (comm.px - glx % comm.rx >= 0) ? glx / comm.rx : glx / comm.rx + 1;
+        l_l[1] = (comm.py - gly % comm.ry >= 0) ? gly / comm.ry : gly / comm.ry + 1;
+        l_l[2] = (comm.pz - glz % comm.rz >= 0) ? glz / comm.rz : glz / comm.rz + 1;
+        // local length
+        lx = l_l[0] + 2 * ghost;
+        ly = l_l[1] + 2 * ghost;
+        lz = l_l[2] + 2 * ghost;
+
+        ldx = l_l[0] + 2 * ghost;
+        ldy = l_l[1] + 2 * ghost;
+        ldz = l_l[2] + 2 * ghost;
+
+        ex = l_l[0];
+        ey = l_l[1];
+        ez = l_l[2];
+
+        l_s[0] = ghost;
+        l_s[1] = ghost;
+        l_s[2] = ghost;
+        // local end
+        l_e[0] = l_s[0] + l_l[0];
+        l_e[1] = l_s[1] + l_l[1];
+        l_e[2] = l_s[2] + l_l[2];
+
+        int x_his[comm.rx];
+        int y_his[comm.ry];
+        int z_his[comm.rz];
+
+        MPI_Allgather(l_l, 1, MPI_INT, x_his, 1, MPI_INT, comm.comm);
+
+        for (int i = 0; i <= comm.px; i++)
+        {
+            x_hi += x_his[i];
+        }
+        x_lo = x_hi - l_l[0];
+        x_hi = x_hi - 1;
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Allgather(l_l + 1, 1, MPI_INT, y_his, 1, MPI_INT, comm.comm);
+        for (int j = 0; j <= comm.py; j++)
+        {
+            y_hi += y_his[j];
+        }
+        y_lo = y_hi - l_l[1];
+        y_hi = y_hi - 1;
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Allgather(l_l + 2, 1, MPI_INT, z_his, 1, MPI_INT, comm.comm);
+
+        for (int k = 0; k <= comm.pz; k++)
+        {
+            z_hi += z_his[k];
+        }
+        // local low and local high
+        z_lo = z_hi - l_l[2];
+        z_hi = z_hi - 1;
+
+        std::cout << "Selected device:" << Q.get_device().get_info<info::device::name>() << "\n";
+
+        f = malloc_shared<double>(q * lx * ly * lz, this->Q);
+
+        ft = malloc_shared<double>(q * lx * ly * lz, this->Q);
+        fb = malloc_shared<double>(q * lx * ly * lz, this->Q);
+
+        ua = malloc_shared<double>(lx * ly * lz, this->Q);
+        va = malloc_shared<double>(lx * ly * lz, this->Q);
+        wa = malloc_shared<double>(lx * ly * lz, this->Q);
+
+        rho = malloc_shared<double>(lx * ly * lz, this->Q);
+        p = malloc_shared<double>(lx * ly * lz, this->Q);
+
+        usr = malloc_shared<int>(lx * ly * lz, this->Q);
+        ran = malloc_shared<int>(lx * ly * lz, this->Q);
+        bb = malloc_shared<int>(q, Q);
+
+        MPI_Barrier(MPI_COMM_WORLD);
+    };
+
+    void Initialize();
+    void Collision();
+    void setup_subdomain();
+    void pack();
+    void exchange();
+    void unpack();
+    void Streaming();
+    void Update();
+    void MPIoutput(int n);
+    void Output(int n);
+};
+#endif
