@@ -319,13 +319,11 @@ void LBM::Streaming()
     rdy = l_e[1] - ghost;
     rdz = l_e[2] - ghost;
 
-    printf("rdx=%d,rdy=%d,rdz=%d\n", l_s[0], l_s[1], l_s[2]);
-
     if (y_lo == 0)
     {
 
         auto bcfr = this->Q.submit([&](handler &h)
-                                   { 
+                                   {
                                     accessor eee{ee, h, read_only};
 
                                     int llx = lx;
@@ -334,10 +332,10 @@ void LBM::Streaming()
                                     h.parallel_for(range{ rdx+2, rdz+2}, [=,ls=this->l_s,fq=this->f,ftq=this->ft,bbq=this->bb](id<2> idx)
                                                      {
                                              int id0 = idx[0] + ghost-1;
-                                             int id1 = ls[1];
+                                             int id1 = ls[1]-1;
                                              int id2 = idx[1] + ghost-1;
                                              int id = id0 + id1 * llx + id2 * llx * lly;
-                                             
+
                                              for (int ii = 0; ii < q;ii++){
                                                     if (eee[ii*3+1]>0)
                                                         {
@@ -347,7 +345,7 @@ void LBM::Streaming()
 
                          } }); });
     }
-
+    this->Q.wait();
     if (y_hi == gly - 1)
     {
 
@@ -375,6 +373,7 @@ void LBM::Streaming()
                          } }); });
     }
 
+    this->Q.wait();
     if (z_lo == 0)
     {
 
@@ -401,7 +400,7 @@ void LBM::Streaming()
 
                          } }); });
     }
-
+    this->Q.wait();
     if (z_hi == glz - 1)
     {
 
@@ -428,7 +427,7 @@ void LBM::Streaming()
 
                          } }); });
     }
-
+    this->Q.wait();
     if (x_lo == 0)
     {
 
@@ -455,6 +454,7 @@ void LBM::Streaming()
 
                          } }); });
     }
+    this->Q.wait();
     MPI_Barrier(MPI_COMM_WORLD);
     // right boundary free flow
     if (x_hi == glx - 1)
@@ -483,6 +483,7 @@ void LBM::Streaming()
                          } }); });
     }
     // streaming process
+    this->Q.wait();
     MPI_Barrier(MPI_COMM_WORLD);
 
     auto usrb = this->Q.submit([&](handler &h)
@@ -508,7 +509,7 @@ void LBM::Streaming()
                                                         }
 
                          } }); });
-
+    this->Q.wait();
     auto stream1 = this->Q.submit([&](handler &h)
                                   {
                                     accessor eee{ee, h, read_only};
@@ -526,7 +527,7 @@ void LBM::Streaming()
                                              for (int ii = 0; ii < q;ii++){
                                                  int idt = (id0 - eee[ii * dim]) + (id1 - eee[ii * dim + 1])*llx + (id2 - eee[ii * dim + 2])*llx*lly;
 
-                                                 fq[ii + q * id] = ftq[ii + q * idt];
+                                                 ftq[ii + q * id] = fq[ii + q * idt];
                          } }); });
     this->Q.wait();
     auto stream2 = this->Q.submit([&](handler &h)
@@ -544,7 +545,7 @@ void LBM::Streaming()
 
                                                  fq[ii + q * id] = ftq[ii + q * id];
                          } }); });
-
+    this->Q.wait();
     MPI_Barrier(MPI_COMM_WORLD);
 };
 
