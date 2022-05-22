@@ -19,6 +19,7 @@ struct CommHelper
 {
 
     MPI_Comm comm;
+    int nranks;
     int rx, ry, rz;
     int me;
     int px, py, pz;
@@ -27,7 +28,7 @@ struct CommHelper
     CommHelper(MPI_Comm comm_)
     {
         comm = comm_;
-        int nranks;
+
         MPI_Comm_size(comm, &nranks);
         MPI_Comm_rank(comm, &me);
 
@@ -114,9 +115,6 @@ struct LBM
     int lz;
     // 3,3,3  262,35,67
     // 256,32,64
-    int l_s[3];
-    int l_e[3];
-    int l_l[3];
 
     int x_lo = 0;
     int x_hi = 0;
@@ -132,7 +130,7 @@ struct LBM
 
     std::array<int, q * dim> e;
     std::array<double, q> t;
-
+    int *l_s, *l_e, *l_l;
     double *m_left, *m_right, *m_down, *m_up, *m_front, *m_back;
     double *m_leftout, *m_rightout, *m_downout, *m_upout, *m_frontout, *m_backout;
     // 12 edges
@@ -141,13 +139,17 @@ struct LBM
     // 8 points
     double *m_frontleftup, *m_frontrightup, *m_frontleftdown, *m_frontrightdown, *m_backleftup, *m_backleftdown, *m_backrightup, *m_backrightdown;
     double *m_frontleftupout, *m_frontrightupout, *m_frontleftdownout, *m_frontrightdownout, *m_backleftupout, *m_backleftdownout, *m_backrightupout, *m_backrightdownout;
-
+    MPI_Datatype m_face[3], m_line[3], m_point;
     double *f, *ft, *fb, *ua, *va, *wa, *rho, *p;
     int *usr, *ran, *bb;
     queue Q{};
 
     LBM(MPI_Comm comm_, int sx, int sy, int sz, double &tau, double &rho0, double &u0) : comm(comm_), glx(sx), gly(sy), glz(sz), tau0(tau), rho0(rho0), u0(u0)
     {
+
+        l_l = malloc_shared<int>(dim, this->Q);
+        l_s = malloc_shared<int>(dim, this->Q);
+        l_e = malloc_shared<int>(dim, this->Q);
 
         l_l[0] = (comm.px - glx % comm.rx >= 0) ? glx / comm.rx : glx / comm.rx + 1;
         l_l[1] = (comm.py - gly % comm.ry >= 0) ? gly / comm.ry : gly / comm.ry + 1;
@@ -168,39 +170,62 @@ struct LBM
         l_s[0] = ghost;
         l_s[1] = ghost;
         l_s[2] = ghost;
+
         // local end
         l_e[0] = l_s[0] + l_l[0];
         l_e[1] = l_s[1] + l_l[1];
         l_e[2] = l_s[2] + l_l[2];
 
-        int x_his[comm.rx];
-        int y_his[comm.ry];
-        int z_his[comm.rz];
+        int x_his[comm.nranks];
+        int y_his[comm.nranks];
+        int z_his[comm.nranks];
+        int ax_his[comm.rx][comm.ry][comm.rz];
+        int ay_his[comm.rx][comm.ry][comm.rz];
+        int az_his[comm.rx][comm.ry][comm.rz];
 
         MPI_Allgather(l_l, 1, MPI_INT, x_his, 1, MPI_INT, comm.comm);
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        MPI_Allgather(l_l + 1, 1, MPI_INT, y_his, 1, MPI_INT, comm.comm);
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        MPI_Allgather(l_l + 2, 1, MPI_INT, z_his, 1, MPI_INT, comm.comm);
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        for (int i = 0; i < comm.rx; i++)
+        {
+            for (int j = 0; j < comm.ry; j++)
+            {
+                for (int k = 0; k < comm.rz; k++)
+                {
+                    ax_his[i][j][k] = x_his[i + j * (comm.rx) + k * (comm.rx) * (comm.ry)];
+                    ay_his[i][j][k] = y_his[i + j * (comm.rx) + k * (comm.rx) * (comm.ry)];
+                    az_his[i][j][k] = z_his[i + j * (comm.rx) + k * (comm.rx) * (comm.ry)];
+                }
+            }
+        }
 
         for (int i = 0; i <= comm.px; i++)
         {
-            x_hi += x_his[i];
+            x_hi += ax_his[i][0][0];
         }
-        x_lo = x_hi - l_l[0];
-        x_hi = x_hi - 1;
-        MPI_Barrier(MPI_COMM_WORLD);
-        MPI_Allgather(l_l + 1, 1, MPI_INT, y_his, 1, MPI_INT, comm.comm);
+
         for (int j = 0; j <= comm.py; j++)
         {
-            y_hi += y_his[j];
+            y_hi += ay_his[0][j][0];
         }
-        y_lo = y_hi - l_l[1];
-        y_hi = y_hi - 1;
-        MPI_Barrier(MPI_COMM_WORLD);
-        MPI_Allgather(l_l + 2, 1, MPI_INT, z_his, 1, MPI_INT, comm.comm);
 
         for (int k = 0; k <= comm.pz; k++)
         {
-            z_hi += z_his[k];
+            z_hi += az_his[0][0][k];
         }
-        // local low and local high
+
+        x_lo = x_hi - l_l[0];
+        x_hi = x_hi - 1;
+
+        y_lo = y_hi - l_l[1];
+        y_hi = y_hi - 1;
+
         z_lo = z_hi - l_l[2];
         z_hi = z_hi - 1;
 
@@ -223,14 +248,35 @@ struct LBM
         bb = malloc_shared<int>(q, Q);
 
         MPI_Barrier(MPI_COMM_WORLD);
+        printf("x_lo=%d,y_lo=%d,z_lo=%d,x_hi=%d,y_hi=%d,z_hi=%d\n", x_lo, y_lo, z_lo, x_hi, y_hi, z_hi);
+
+        MPI_Type_vector(1, q * lx * ly, 1, MPI_DOUBLE, &m_face[0]);
+        MPI_Type_commit(&m_face[0]);
+
+        MPI_Type_vector(lz, q * lx, q * lx * ly, MPI_DOUBLE, &m_face[1]);
+        MPI_Type_commit(&m_face[1]);
+
+        MPI_Type_vector(ly * lz, q, lx * q, MPI_DOUBLE, &m_face[2]);
+        MPI_Type_commit(&m_face[2]);
+        // line
+        MPI_Type_vector(1, q * lx, 1, MPI_DOUBLE, &m_line[0]);
+        MPI_Type_commit(&m_line[0]);
+
+        MPI_Type_vector(ly, q, q * lx, MPI_DOUBLE, &m_line[1]);
+        MPI_Type_commit(&m_line[1]);
+
+        MPI_Type_vector(lz, q, lx * ly * q, MPI_DOUBLE, &m_line[2]);
+        MPI_Type_commit(&m_line[2]);
+        // point
+        MPI_Type_vector(1, q, 1, MPI_DOUBLE, &m_point);
+        MPI_Type_commit(&m_point);
+
+        MPI_Barrier(MPI_COMM_WORLD);
     };
 
     void Initialize();
     void Collision();
-    void setup_subdomain();
-    void pack();
     void exchange();
-    void unpack();
     void Streaming();
     void Update();
     void MPIoutput(int n);
