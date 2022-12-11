@@ -324,8 +324,8 @@ void LBM::Streaming()
         Kokkos::parallel_for(
             "stream3", range_policy(1, ly - 1), KOKKOS_CLASS_LAMBDA(const int j) {
                 f(3, lx - 2, j) = f(3, lx - 3, j);
-                f(7, lx - 2, j) = f(7, lx - 3, j + 1);
-                f(6, lx - 2, j) = f(6, lx - 3, j - 1);
+                f(7, lx - 2, j) = f(7, lx - 3, j - 1);
+                f(6, lx - 2, j) = f(6, lx - 3, j + 1);
             });
 
     if (y_lo == 0)
