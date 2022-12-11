@@ -151,8 +151,8 @@ void LBM::Streaming()
             f(8, 1, j) = f(8, 2, j);
 
             f(3, lx - 2, j) = f(3, lx - 3, j);
-            f(7, lx - 2, j) = f(7, lx - 3, j + 1);
-            f(6, lx - 2, j) = f(6, lx - 3, j - 1);
+            f(7, lx - 2, j) = f(7, lx - 3, j - 1);
+            f(6, lx - 2, j) = f(6, lx - 3, j + 1);
         });
 
     Kokkos::parallel_for(
