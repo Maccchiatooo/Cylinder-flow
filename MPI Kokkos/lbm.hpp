@@ -16,6 +16,7 @@
 
 #define q 9
 #define dim 2
+#define ghost 2
 
 struct CommHelper
 {
@@ -65,8 +66,8 @@ struct LBM
     typedef Kokkos::RangePolicy<> range_policy;
     typedef Kokkos::MDRangePolicy<Kokkos::Rank<3>> mdrange_policy3;
     typedef Kokkos::MDRangePolicy<Kokkos::Rank<2>> mdrange_policy2;
-    using buffer_t = Kokkos::View<double **, Kokkos::LayoutLeft, Kokkos::CudaUVMSpace>;
-    using buffer_ut = Kokkos::View<double *, Kokkos::LayoutLeft, Kokkos::CudaUVMSpace>;
+    using buffer_t = Kokkos::View<double **, Kokkos::LayoutLeft, Kokkos::HostSpace>;
+    using buffer_ut = Kokkos::View<double *, Kokkos::LayoutLeft, Kokkos::HostSpace>;
 
     CommHelper comm;
     MPI_Request mpi_requests_recv[8];
@@ -78,7 +79,10 @@ struct LBM
     int lx = glx / comm.rx + 4;
     int ly = gly / comm.ry + 4;
 
-    int x_lo, x_hi, y_lo, y_hi;
+    int x_lo = (lx - 4) * comm.px;
+    int x_hi = (lx - 4) * (comm.px + 1) - 1;
+    int y_lo = (ly - 4) * comm.py;
+    int y_hi = (ly - 4) * (comm.py + 1) - 1;
     double rho0;
     double mu;
     double cs2;
@@ -95,6 +99,9 @@ struct LBM
 
     Kokkos::View<double **, Kokkos::CudaUVMSpace> ua = Kokkos::View<double **, Kokkos::CudaUVMSpace>("u", lx, ly);
     Kokkos::View<double **, Kokkos::CudaUVMSpace> va = Kokkos::View<double **, Kokkos::CudaUVMSpace>("v", lx, ly);
+
+    Kokkos::View<double **, Kokkos::CudaUVMSpace> fdx = Kokkos::View<double **, Kokkos::CudaUVMSpace>("fdx", lx, ly);
+    Kokkos::View<double **, Kokkos::CudaUVMSpace> fdy = Kokkos::View<double **, Kokkos::CudaUVMSpace>("fdy", lx, ly);
     Kokkos::View<double **, Kokkos::CudaUVMSpace> rho = Kokkos::View<double **, Kokkos::CudaUVMSpace>("rho", lx, ly);
     Kokkos::View<double **, Kokkos::CudaUVMSpace> p = Kokkos::View<double **, Kokkos::CudaUVMSpace>("p", lx, ly);
 
@@ -117,5 +124,6 @@ struct LBM
     void Streaming();
     void Update();
     void Output(int n);
+    void MPIoutput(int n);
 };
 #endif
